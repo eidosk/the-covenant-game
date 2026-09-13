@@ -1,0 +1,1874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>The Covenant</title>
+<style>
+  html,body { margin:0; padding:0; background:#000; height:100%; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  canvas { display:block; max-width:100vw; max-height:100vh; background:#1a1a35; cursor:pointer; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1024" height="576"></canvas>
+<script>
+  
+
+  const TEXT = {
+  introTitle:  "THE COVENANT",
+  introStory:  "Long ago, a promise was made. After every storm, a rainbow would appear as a sign of hope, reminding the world that the great flood would never return.",
+  introPrompt: "PRESS ANY KEY TO START",
+  introControls: [
+    "Move with 'ARROW KEYS'.",
+    "'Z' undoes a move.",
+    "'R' restarts the level.",
+    "'SPACE' fires the horn beam.",
+  ],
+
+  // one-line level instruction (see levelBrief) — same text every start and restart
+  briefHorn:   "Follow the path to the horn. Use the arrow keys",
+  briefStorm:  "Clear the storm and reach the exit.",
+  briefGeneric:"Same again - reach the exit.",
+  briefMirror: "Mind the mirror - it bends yer beam.",
+  briefTeleport:"Step in the swirl to cross the board.",
+  briefPanel:  "Stand on the button to open the way.",
+  briefWind:   "Grab the gust to push the rain.",
+  briefBot:    "Yer reflection walks these clouds too.",
+  briefFinale: "Find yer other half.",
+  // beam hits the other unicorn / circles back to you (mirror-unicorn and mirror levels only) —
+  // both refund the shot; a closed mirror loop that reaches nothing does not.
+  beamHitRain:   "Hit yer twin! Cleared rain. No shot lost.",
+  beamHitOnly:   "Hit yer twin. No shot lost.",
+  beamReturnRain:"Beam came back. Cleared rain. No shot lost.",
+  beamReturnOnly:"Beam came back. No shot lost.",
+  beamLoopRain:  "Beam looped. Cleared rain.",
+  beamLoopOnly:  "Beam looped.",
+  originArk:   "Ye were just a horse on the Ark.",
+  originHelp:  "Noah sent me to help ye become somethin' more.",
+  goRainbow:   "Now let's go somewhere...",
+  mmExplain:   "That squishy fella's a marshmallow.",
+  mmWalk:      "Walk to it...",
+  mmCarry:     "Carry it, and drop it in a hole to bridge the gap.",
+
+  // pools (say) — trimmed to one line each 2026-09-13; the array shape stays (say() already
+  // handles length-1 pools correctly) in case variety ever comes back.
+  sky:     ["Nothin' but air that way."],
+  exitBad: ["Clear the storms and that gap'll open."],
+  ringGet: ["Ha! That's the rainbow made, and no mistake!"],
+  beamHit: ["Zap! Rain's done for!"],
+  beamMiss:["Nothin' to zap there."],
+  skewerP: ["Skewered! Nice shot, that."],
+  drop:    ["Down it goes."],
+
+  // fixed one-off lines
+  undoNone:    "Nothin' to undo.",
+  undoDone:    "Poof! Back it goes.",
+  gotHorn:     "A unicorn at last!",
+  firstRainbow:"Would ye look at that - the first rainbow ever!",
+  gotRing:     "A sun beam! Now zap that rain! Press Spacebar",
+  gotWind:     "Gust caught! Push that rain forever now.",
+  botBlock:    "Stubborn as a mule, that reflection.",
+  needSunRing: "Sun beam first, or no gold for ye!",
+  noAmmo:      "Light's spent!",
+  exitHidden:  "Still hidden, keep lookin'!",
+  marshFirm:   "Squish! Solid cloud now, that.",
+  noPush:      "Nowhere to push it, ya eejit.",
+  rainBlocks:  "Rain's blockin'! Clear it, quick.",
+  nextLevel:   "Off to the next patch o' luck!",
+  nextLevel0:  "...over the rainbow.",
+  lastLevel:   "That's the last o' the luck, well done!",
+  mergeDone:   "Found yerself! The mirror melts away.",
+  potFound:    "The pot o' gold! Ye've done it, friend.",
+};
+
+const ctx = document.getElementById('c').getContext('2d');
+ctx.imageSmoothingEnabled = false;   // no antialiasing — crisp pixel-art scaling
+const W = 1024, H = 576;         // canvas size (16:9, fixed pixel grid — see TOPBAR/CELL below)
+
+// --- config ---------------------------------------------------
+const START_LEVEL = 0;         // LEVELS index to boot into — bump this for testing
+const LEVEL_NAV_ENABLED = true;   // N/P keys jump to the next/prev level, for testing — see keydown
+const SKEWER_PUSH = true;      // marshmallow moves via skewer/carry/place (Space) instead of walk-to-push
+                                // — flip to false to revert to classic walk-into-it pushing
+const MUSIC_ENABLED = true;    // background tune, converted from rain.mid (see build_music.js)
+const AUDIO_ENABLED = true;   // master switch for all sound (SFX + music) — see playTone's choke point
+const BOT_MIRROR_ON_BLOCKED = true;   // mirror-unicorn attempts its mirrored step on every directional
+                                // input, even when the player's own move is blocked — flip to false to
+                                // revert to only mirroring the player's successful moves (see handleMove)
+const LEVEL_TRANSITION_MS = 1200;   // pause on "cross the rainbow" before the next level loads
+const BEAM_FLASH_MS = 220;     // how long the horn-beam flash lingers before clearing
+const BEAM_STEP_MS = 30;       // ms per cell while the beam travels — fast, but visibly moving
+const SPRITE_SCALE = 2;        // pixel-perfect integer scale for the unicorn sprite (32px source -> SPRITE_SCALE*32px drawn)
+
+// --- sprite atlas ---------------------------------------------
+// every sprite + the bitmap font lives in one atlas.png (built by build_atlas.ps1 from the
+// individual source PNGs — re-run that script by hand if any source sprite or the font changes).
+const atlas = new Image();
+atlas.src = 'atlas.png';
+let atlasLoaded = false;
+atlas.onload = () => { atlasLoaded = true; draw(); };
+
+// fixed offsets within atlas.png — see build_atlas.ps1's shelf layout for how these were chosen
+const ATLAS_CLOUD = { x:0, y:0, w:48, h:48 };            // clouds2.png, 9-slice sheet
+// side view's head is cut out of the body and swapped as its own piece — headX/headY is where it
+// sits in the unicorn's own 32x32 space. Drawing one whole extended-horn sprite as an overlay on
+// top of the normal body (an earlier version of this) left the normal head's edges peeking out
+// from behind the skewer head wherever the two don't pixel-align — "two heads" ghosting.
+const ATLAS_BODY = { x:48, y:0, w:32, h:32 };            // side view, headless; flipped via aimDx
+const ATLAS_HEAD_NORMAL = { x:144, y:0, w:18, h:18, headX:14, headY:2 };
+const ATLAS_HEAD_SKEWER = { x:162, y:0, w:25, h:18, headX:14, headY:2 };
+const ATLAS_UNICORN_FRONT = { x:80, y:0, w:32, h:32 };   // facing viewer — used moving down
+const ATLAS_UNICORN_BACK = { x:112, y:0, w:32, h:32 };   // facing away — used moving up
+const ATLAS_MM = { x:0, y:48, w:32, h:32 };
+const ATLAS_RAIN_CLOUD = { x:32, y:48, w:32, h:32 };
+const ATLAS_SUN = { x:64, y:48, w:32, h:32 };
+const ATLAS_LEPRECHAUN = { x:96, y:48, w:17, h:19 };   // narrator portrait, top bar
+const ATLAS_HORN = { x:0, y:130, w:32, h:32 };
+// level0 origin story: the horse has no horn until it finds the 'H' tile — see state.hasHorn.
+// There's no horse art at all: ATLAS_HEAD_NORMAL/UNICORN_FRONT/UNICORN_BACK are natively hornless
+// (clipped at build time, see build_atlas.ps1), and these three tiny pieces are drawn back on top
+// only while hasHorn is true (drawUnicornSide and the front/back branch below) — being a horse
+// vs. a unicorn is just whether this overlay gets drawn, nothing more. Front and back need their
+// own piece (not shared) since each sprite's mane starts at a different point below its horn.
+const ATLAS_HORN_SIDE = { x:32, y:130, w:9, h:8, offX:9, offY:0 };
+const ATLAS_HORN_FRONT = { x:41, y:130, w:5, h:9, offX:13, offY:0 };
+const ATLAS_HORN_BACK = { x:46, y:130, w:4, h:5, offX:13, offY:0 };
+const ATLAS_GRASS = { x:128, y:130, w:16, h:16 };   // level0's ground terrain — see drawGroundTile
+const CLOUD_TILE = 16;
+
+const SPRITE_SIZE = 32 * SPRITE_SCALE;       // 32px source sprite -> SPRITE_SCALE*32px drawn
+
+// --- bitmap font (Dogica Pixel, 8px, hand-converted from font.fnt — see CLAUDE.md) -------------
+// {char: [atlasX, atlasY, w, h, xoffset, yoffset, xadvance]}; space isn't a glyph, see SPACE_ADV
+const GLYPHS = {"!":[48,88,1,7,1,0,3],"'":[33,112,2,3,1,1,4],",":[36,112,2,3,1,5,4],"-":[39,112,4,1,1,4,6],".":[48,96,1,1,1,6,3],"/":[0,80,4,8,1,0,6],"0":[12,88,5,7,1,0,7],"1":[18,88,5,7,1,0,7],"2":[24,88,5,7,1,0,7],"3":[27,80,5,7,1,0,7],"4":[30,88,5,7,1,0,7],"5":[36,88,5,7,1,0,7],"6":[42,88,5,7,1,0,7],"7":[0,97,5,7,1,0,7],"8":[6,96,5,7,1,0,7],"9":[12,96,5,7,1,0,7],"?":[18,96,5,7,1,0,7],"A":[24,96,5,7,1,0,7],"B":[30,96,5,7,1,0,7],"C":[36,96,5,7,1,0,7],"D":[20,80,6,7,1,0,8],"E":[6,88,5,7,1,0,7],"F":[0,105,5,7,1,0,7],"G":[6,104,5,7,1,0,7],"H":[12,104,5,7,1,0,7],"I":[29,112,3,7,1,0,5],"J":[45,80,4,7,1,0,6],"K":[18,104,5,7,1,0,7],"L":[24,112,4,7,1,0,6],"M":[13,80,6,7,1,0,8],"N":[24,104,5,7,1,0,7],"O":[30,104,5,7,1,0,7],"P":[36,104,5,7,1,0,7],"Q":[42,104,5,7,1,0,7],"R":[0,113,5,7,1,0,7],"S":[6,112,5,7,1,0,7],"T":[12,112,5,7,1,0,7],"U":[42,96,5,7,1,0,7],"V":[18,112,5,7,1,0,7],"W":[5,80,7,7,1,0,9],"X":[33,80,5,7,1,0,7],"Y":[39,80,5,7,1,0,7],"Z":[0,89,5,7,1,0,7]};
+const GLYPH_H = 8;      // font.fnt lineHeight
+const SPACE_ADV = 4;    // hardcoded advance for ' ' — no glyph needed, see feedback this session
+const TEXT_SCALE = 2;   // native glyph px -> on-screen scale
+
+// --- audio: hand-rolled Web Audio SFX, zero dependencies -------
+let actx;
+function ensureAudio(){
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === 'suspended') actx.resume();
+}
+function playTone(freq, dur, type, vol, delay){
+  if (!AUDIO_ENABLED) return;   // single choke point — every sfx*/music call routes through here
+  ensureAudio();
+  const t0 = actx.currentTime + (delay||0);
+  const osc = actx.createOscillator();
+  osc.type = type || 'triangle';
+  osc.frequency.setValueAtTime(freq, t0);
+  const gain = actx.createGain();
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(vol||0.2, t0+0.01);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+  osc.connect(gain); gain.connect(actx.destination);
+  osc.start(t0); osc.stop(t0+dur+0.02);
+}
+const sfxBlocked  = () => playTone(120, 0.08, 'square', 0.15, 0);
+const sfxPush     = () => playTone(220, 0.07, 'square', 0.15, 0);
+const sfxPickup   = () => { playTone(660, 0.09, 'triangle', 0.2, 0); playTone(880, 0.12, 'triangle', 0.2, 0.09); };
+const sfxDissolve = () => { playTone(1046.5, 0.08, 'sine', 0.16, 0); playTone(1318.5, 0.08, 'sine', 0.16, 0.06); playTone(1568, 0.14, 'sine', 0.16, 0.12); };
+const sfxWin      = () => { playTone(783.99, 0.12, 'triangle', 0.25, 0); playTone(987.77, 0.12, 'triangle', 0.25, 0.12); playTone(1174.66, 0.22, 'triangle', 0.25, 0.24); };
+
+// --- background music: melody + chords, scheduled ahead of time to avoid drift ---
+// Both arrays converted from rain.mid (dev-only, see build_music.js) — melody is monophonic
+// [freq, beats] like the old placeholder tune; chords adds a second, quieter [freqs[], beats]
+// voice for the harmony track. Built against one shared loop length so the two stay in phase
+// on every repeat; freq 0 / an empty freqs[] is an explicit rest (silence, not a note).
+const TUNE = [[0,7.5],[784,3.5],[0,0.5],[698,1.5],[0,1],[698,0.5],[659,0.75],[587,0.5],[0,0.25],[659,0.5],[523,0.5],[0,0.25],[392,1.25],[0,2.5],[587,0.5],[659,0.5],[587,0.5],[523,0.5],[0,0.5],[784,5.5],[0,0.5],[523,0.25],[0,0.25],[698,0.5],[659,0.75],[587,0.5],[0,0.25],[659,0.5],[523,0.5],[392,2],[0,6.5],[698,1],[659,1],[587,0.75],[0,4.75],[523,0.5],[698,1],[659,0.5],[523,0.5],[587,0.75],[0,5.25],[698,0.75],[0,0.25],[659,1],[587,0.75],[0,0.25],[659,0.75],[0,0.25],[587,0.75],[0,0.25],[523,0.75],[0,0.25],[587,2.75],[0,3.25],[392,0.5],[440,0.5],[523,0.5],[0,0.5],[523,0.5],[0,5.5],[392,0.5],[440,0.5],[523,0.5],[0,0.5],[523,0.5],[0,7.5],[784,5.5],[0,1],[698,0.5],[659,0.75],[587,0.5],[0,0.25],[659,0.5],[523,0.5],[0,0.25],[392,1.25],[0,2.5],[587,0.5],[659,0.5],[587,0.5],[523,0.5],[0,0.5],[784,5.5],[0,0.5],[523,0.25],[0,0.25],[698,0.5],[659,0.75],[587,0.5],[0,0.25],[659,0.5],[523,0.5],[392,2],[0,6.5],[698,1],[659,1],[587,0.75],[0,4.75],[523,0.5],[698,1],[659,0.5],[523,0.5],[587,0.75],[0,5.25],[698,0.75],[0,0.25],[659,1],[587,0.75],[0,0.25],[659,0.75],[0,0.25],[587,0.75],[0,0.25],[523,0.75],[0,0.25],[587,2.75],[0,3.25],[392,0.5],[440,0.5],[523,0.5],[0,0.5],[523,0.5],[0,1.5],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[587,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[440,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[587,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[440,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[587,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[440,2.5],[0,1.5],[554,1.5],[0,1],[554,0.25],[587,0.25],[554,0.25],[587,0.25],[554,0.25],[587,0.25],[554,0.25],[523,1],[0,0.75],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[587,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[440,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[587,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[440,1],[0,1],[523,0.25],[0,0.25],[494,0.25],[0,0.25],[440,0.25],[0,0.75],[587,0.25],[659,0.25],[659,0.25],[0,1.25],[587,0.25],[659,0.5],[0,1.25],[392,0.25],[784,1.75],[0,6.5]];
+const CHORDS = [[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[659,494,784],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[659,494,784],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[587,880,698],0.5],[[],0.5],[[587,880,698],0.5],[[],0.5],[[523,784,659],0.5],[[],0.5],[[523,784,659],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587,698],0.5],[[],0.5],[[392,494,587,698],0.5],[[],0.5],[[392,494,587,698],0.5],[[],0.5],[[392,494,698,587],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[659,494,784],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[587,494,784],0.5],[[],0.5],[[659,494,784],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[698,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[659,349,880,523],0.5],[[],0.5],[[587,880,698],0.5],[[],0.5],[[587,880,698],0.5],[[],0.5],[[523,784,659],0.5],[[],0.5],[[523,784,659],0.5],[[],0.5],[[466,587,698],0.5],[[],0.5],[[466,587,698],0.5],[[],0.5],[[466,587,698],0.5],[[440],0.5],[[415,587,698],0.5],[[392],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[392,494,587],0.5],[[],0.5],[[523,349,659,440],3.75],[[],0.25],[[587,392,659,494],3.75],[[],0.25],[[523,349,659,440],3.75],[[],0.25],[[587,392,659,494],3.75],[[],0.25],[[523,349,659,440],3.75],[[],0.25],[[587,392,659,494],3.75],[[],0.25],[[659,440,554],8],[[523,349,659,440],3.75],[[],0.25],[[587,392,659,494],3.75],[[],0.25],[[523,349,659,440],3.75],[[],0.25],[[587,392,659,494],3.75],[[],0.25],[[523,349,659,440],3.75],[[],0.25],[[587,392,659,494],2],[[587,392,659,494],2],[[784,523,659],0.5],[[],0.5],[[784,659,523],0.75],[[],0.25],[[784,587,494],0.5],[[],0.5],[[784,587,494],0.75],[[],0.25],[[440,523,784],0.5],[[],0.5],[[784,523,440],0.5],[[],0.5],[[392,494,784],0.5],[[],0.5],[[392,494,784],1]];
+const TUNE_TEMPO = 60/84;      // seconds per beat — rain.mid's actual tempo (84bpm)
+const TUNE_LOOKAHEAD = 0.15;   // schedule this far ahead each scheduler tick
+let tuneIdx = 0, nextNoteTime = 0, chordIdx = 0, nextChordTime = 0, musicOn = false;
+function scheduleTune(){
+  while (nextNoteTime < actx.currentTime + TUNE_LOOKAHEAD){
+    const [freq, beats] = TUNE[tuneIdx];
+    if (freq) playTone(freq, beats*TUNE_TEMPO*0.85, 'sine', 0.07, nextNoteTime - actx.currentTime);
+    nextNoteTime += beats*TUNE_TEMPO;
+    tuneIdx = (tuneIdx+1) % TUNE.length;
+  }
+  while (nextChordTime < actx.currentTime + TUNE_LOOKAHEAD){
+    const [freqs, beats] = CHORDS[chordIdx];
+    const delay = nextChordTime - actx.currentTime;
+    for (const f of freqs) playTone(f, beats*TUNE_TEMPO*0.85, 'sine', 0.035, delay);
+    nextChordTime += beats*TUNE_TEMPO;
+    chordIdx = (chordIdx+1) % CHORDS.length;
+  }
+}
+function startMusic(){
+  if (!MUSIC_ENABLED || musicOn || !state.hasHorn) return;   // silent until the horn's found — see tryCollectHorn
+  ensureAudio();
+  musicOn = true;
+  nextNoteTime = actx.currentTime;
+  nextChordTime = actx.currentTime;
+  scheduleTune();
+  setInterval(scheduleTune, 100);
+}
+
+// --- LEVELS -----------------------------------------------------
+// Tiles: . sky(void) | C cloud | M marshmallow — a standing object (not walkable-through): walk
+// into it to skewer it on the horn, then drag/pull/release (SKEWER_PUSH; see the M branch in
+// handleMove and attemptMove) — no Space to pick up, that's W-only now. SKEWER_PUSH=false:
+// classic walk-into-it push instead, see PUSHABLE. Dragged onto sky, M is spent and leaves plain
+// cloud C (ported from Escape's T_GREY). W gust — a one-time pickup like a sun ring: walking onto
+// it auto-collects it (no Space needed) and permanently unlocks pushing rain for the rest of the
+// game (hasWind — except a level with its own W tile re-requires it, see resetLevel).
+// S rain — not walkable, cleared only by the beam (see below), and normally not pushable either;
+// but once a gust has been collected (hasWind), walking into a rain tile shoves it as far as it'll
+// go onto plain cloud (never onto sky), stopping at the first obstacle or the grid
+// edge — lets several line up for one beam shot. Clears to plain
+// cloud on a beam hit, but see level.reveals: {x,y,tile} for rain tiles with something in the "alt
+// layer" underneath, revealed once that specific rain tile is cleared | switch X (beam swaps
+// target cell, see level.switches) | button (not a map tile —
+// drawn/checked by coordinate via level.panels, live-weighted not sticky: while the unicorn or a
+// marshmallow sits on it, the effect holds; step or pick the marshmallow back off and it reverts
+// — see panelWeighted. Two effects, independent and combinable on one panel: {x,y,ring} reveals a
+// hidden ring (see isRingVisible); {x,y,swapAt:{x,y},altTile} swaps a *distant* cell between its
+// normal tile and altTile — e.g. a hole opening into floor — see syncPanelSwaps. level2's (5,6)
+// panel carries both, matching one .esx tile<->otile swap that lands a ring) | / \ pushable full mirrors
+// — reflect the beam from all 4 sides, no pass-through, always walk-to-push regardless of
+// SKEWER_PUSH. Only M blocks the beam; everything else is walk-through/see-through (mirrors
+// aren't walkable though — push only, like M) | teleport P (two-way portal pair — walking onto
+// either end warps you to the other; dragging a skewered M (or placing an M/W) onto a portal
+// passes the object through to the linked cell instead, ending the carry there; the
+// horn beam passes through it as well, reappearing from the far end still traveling the same
+// direction, drawn as a separate segment rather than a line connecting the two — see
+// level.teleports: {x,y,tx,ty}, teleportAt/teleportOther, and the P handling in
+// handleMove/traceBeamPath; ported from Escape's T_TRANSPORT/dest, made
+// bidirectional). checkWin = no S left && ring collected. Exit -> next LEVELS
+// entry. All levels 16x8 (TOPBAR/CELL below assume this).
+const LEVELS = [
+  {
+    // level0 — origin story, resynced from level0.esx as of 2026-09-13 (hand-authored, not a
+    // ported Escape puzzle): solid ground. T_ROUGH=grass ('G', scenery, not walkable, see
+    // handleMove), T_ELECTRIC=path ('D'), T_UP=horn ('H'), T_STOP=storm ('S'), T_HEARTFRAMER=the
+    // sun beam right after the horn at (10,2), T_SLEEPINGDOOR=exit at (15,4). Fire the beam
+    // (any direction with a clear line) to clear the three storm tiles, then reach the exit.
+    map: [
+      "GGGGGGGGGGGGGGGG",
+      "GGGGGGGGGGGGGGGG",
+      "GGGGGGDDHDDGGSSS",
+      "GGGGGGDGGGDGGGGG",
+      "DDDDDDDGGGDDDDDD",
+      "GGGGGGGGGGGGGGGG",
+      "GGGGGGGGGGGGGGGG",
+      "GGGGGGGGGGGGGGGG",
+    ],
+    start: { x: 0, y: 4 },
+    exit: { x: 15, y: 4 },
+    rings: [{ x: 10, y: 2 }],
+    startsWithoutHorn: true,
+  },
+  {
+    // level1 "The Marshmallow" — resynced from level1.esx as of 2026-09-06. A floor room walled on
+    // all four sides by rain (T_STOP), void (T_HOLE) outside it; start dead-centre at (7,4) with 4
+    // sun beams in a plus around it. Marshmallow (T_GREY) at (2,5); exit (T_EXIT) out in the void
+    // at (15,0), reachable only via the one-cell gap in the rain wall at (14,1). Stray inert otile
+    // at (2,0) omitted as on the other levels, not a ring.
+    map: [
+      "...............C",
+      ".SSSSSSSSSSSSSC.",
+      ".SCCCCCCCCCCCCC.",
+      ".SCCCCCCCCCCCCS.",
+      ".SCCCCCCCCCCCCS.",
+      ".SMCCCCCCCCCCCS.",
+      ".SSSSSSSSSSSSSS.",
+      "................",
+    ],
+    start: { x: 7, y: 4 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 7, y: 3 }, { x: 6, y: 4 }, { x: 8, y: 4 }, { x: 7, y: 5 } ],
+  },
+  {
+    // level2 (swapped with level4, 2026-09-13; was "Level 4: Mirror") — same cols-7-8 hole wall
+    // and 2 marshmallows at (3,3)/(2,4), start (2,1), exit (14,1); ring at (11,3); row 7 is a rain
+    // band (cols 0-7) ending in a '/' mirror at (14,7) (from Escape's T_NW corner-reflector).
+    map: [
+      "................",
+      ".CCCCCC..CCCCCC.",
+      ".CCCCCC..CCCCCC.",
+      ".CCMCCC..CCCCCC.",   // marshmallow at (3,3); ring at (11,3)
+      ".CMCCCC..CCCCCC.",   // marshmallow at (2,4) — cols 7-8 are both open hole, no shortcut
+      ".CCCCCC..CCCCCC.",
+      ".CCCCCC..CCCCCC.",
+      "SSSSSSSS....../.",   // rain band cols 0-7; '/' mirror at (14,7) from T_NW
+    ],
+    start: { x: 2, y: 1 },
+    exit: { x: 14, y: 1 },
+    rings: [ { x: 11, y: 3 } ],
+  },
+  {
+    // level3 — authored here in index.html and exported the other way, via html_to_esx.js, to
+    // level3.esx (reverse of the usual "sync levelN" flow). This is the puzzle that lived in the
+    // level5 slot: a 2-wide full-height hole wall at cols 7-8, left half = start, right half =
+    // ring at (10,0) + exit at (15,0), crossed only via the two-way teleport pair at
+    // (2,4)<->(13,4). Rain in 4 patches — col 13 rows 0-3, row 4 cols 3-6, row 4 cols 9-10, col 2
+    // rows 5-6 (12 tiles), but only 1 ring/1 ammo, so still under-resourced — needs another ring
+    // or fewer rain tiles; flagged, not fixed.
+    map: [
+      "CCCCCCC..CCCCSCC",
+      "CCCCCCC..CCCCSCC",
+      "CCCCCCC..CCCCSCC",
+      "CCCCCCC..CCCCSCC",
+      "CCPSSSS..SSCCPCC",   // teleport pair (2,4)<->(13,4), flanked by rain on both sides
+      "CCSCCCC..CCCCCCC",
+      "CCSCCCC..CCCCCCC",
+      "CCCCCCC..CCCCCCC",
+    ],
+    start: { x: 2, y: 1 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 10, y: 0 } ],
+    teleports: [ { x: 2, y: 4, tx: 13, ty: 4 } ],
+  },
+  {
+    // level4 (swapped with level2, 2026-09-13; was "Level 2: Buttons") — start (0,4) on a left
+    // spur; exit at (14,0); a full-height rain column down col 15 (rows 0-6); 4 marshmallows at
+    // (6,2)(11,2)(6,5)(11,5); 4 weighted panels. Three each open one row-7 bridge cell —
+    // (5,1)->(12,7), (12,1)->(13,7), (12,6)->(14,7); the fourth, (5,6), both opens (15,7) and
+    // reveals the hidden sun beam there (one combined swapAt+ring panel, matching the .esx
+    // tile<->otile swap). Bridge row 7 with marshmallows, grab the beam (1 ammo), fire it up
+    // col 15 to clear the whole rain column at once, then walk col 15 up to (15,0) and left into
+    // the exit.
+    map: [
+      "..............CS",
+      ".....CC...CCC..S",
+      ".....CMCCCCMC..S",
+      ".....C.....C...S",
+      "CCCCCC.....CC..S",
+      ".....CMCC..MC..S",
+      ".....CCCCCCCC..S",
+      "...........C....",
+    ],
+    start: { x: 0, y: 4 },
+    exit: { x: 14, y: 0 },
+    rings: [ { x: 15, y: 7, hidden: true } ],
+    panels: [
+      { x: 5,  y: 1, swapAt: { x: 12, y: 7 }, altTile: 'C' },
+      { x: 12, y: 1, swapAt: { x: 13, y: 7 }, altTile: 'C' },
+      { x: 12, y: 6, swapAt: { x: 14, y: 7 }, altTile: 'C' },
+      { x: 5,  y: 6, swapAt: { x: 15, y: 7 }, altTile: 'C', ring: 0 },
+    ],
+  },
+  {
+    // level5 — resync from level5.esx ("Level 5: Cotton Candy") as of 2026-09-10; only the shaft
+    // changed vs the prior decode — its two cotton candies became floor (9,4) + marshmallow (9,5), no K left.
+    map: [
+      "C.CCCCCCCCCC...C",
+      "P.MCCCCCCCCCC...",   // marshmallow at (2,1)
+      "..CCCCCC...CCC..",   // shaft holes reach row 2 at (8-10,2)
+      "SSSSSSSS.P.CCCC.",   // rain band cols0-7; teleport far end (9,3)
+      "CCCCCCCC.C.CCCCC",   // (9,4) plain floor now
+      "CCCCCCCC.M.CCCCC",   // marshmallow at (9,5); ring at (13,5)
+      "CCCCCCCCCMCCCCCC",   // marshmallow at (9,6)
+      "CCCCCCCCCCCCCCCC",
+    ],
+    start: { x: 9, y: 1 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 13, y: 5 } ],
+    panels: [ { x: 0, y: 0, swapAt: { x: 14, y: 1 }, altTile: 'C' } ],
+    teleports: [ { x: 0, y: 1, tx: 9, ty: 3 } ],
+  },
+  {
+    // level6 — resynced from level6.esx ("Level 6: Mirrors") as of 2026-09-06; changes vs the prior
+    // decode: rain at (10,1) removed (top-left is now fully open floor) and the row5 band extended
+    // east to col12 while its detached (13,5) tile was dropped (band is now contiguous cols1-12).
+    // Layout: row0 band cols3-12, row5 band cols1-12, verticals at col0 (rows1-4), col10 (rows2-3),
+    // col13 (rows2-4). Reflectors T_NE(4,3) ported '\', T_NW(6,3) & T_SE(8,3) ported '/'
+    // (edge-connection -> our full-mirror beam behavior; T_NW='/' matches level4's port).
+    // Start (2,1); ring (T_HEARTFRAMER) at (2,3); exit (T_SLEEPINGDOOR) at (15,0). No panels/teleports/bot.
+    // NOT SOLVABLE AS-IS: T_STOP maps to rain, so all ~32 wall tiles must be beam-cleared, but
+    // there's 1 ring = 1 ammo and one bounced beam can't reach rain spread across the whole board.
+    // In Escape T_STOP is just an impassable wall you route around; flagging rather than guessing a fix.
+    map: [
+      "CCCSSSSSSSSSSCCC",
+      "SCCCCCCCCCCCCCCC",
+      "SCCCCCCCCCSCCSCC",
+      "SCCS\\S/S/SCCCSCC",   // ring at (2,3); reflectors at cols 4/6/8
+      "SCCCCCCCCCCCCSCC",
+      "CSSSSSSSSSSSSCCC",
+      "CCCCCCCCCCCCCCCC",
+      "CCCCCCCCCCCCCCCC",
+    ],
+    start: { x: 2, y: 1 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 2, y: 3 } ],
+  },
+  {
+    // level7 — resynced from level7.esx as of 2026-09-12: the cotton candy at (6,1) is now a
+    // marshmallow (K/T removed from the engine); rest of the board unchanged.
+    map: [
+      "CCCC.CCC..CCCCCC",
+      "CMCM.CMC..CCCCCC",
+      "CCCC.CCC..CCCCCC",
+      "..........CCCCCC",
+      "/.........CCCCSC",
+      "..........CCCCCC",
+      "..........CCCCCC",
+      "\\............SSS",
+    ],
+    start: { x: 2, y: 1 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 12, y: 6 } ],
+  },
+  {
+    // level8 ("Level 8: Wind" in the .esx) — resync: added M (marshmallow, T_GREY) at (3,2) and
+    // the gust pickup (T_BSPHERE, new tile type — a blue sphere in Escape) at (3,4); rain (S)
+    // moved off the (12-14,1) cluster to (13,2) and (5,5).
+    map: [
+      "................",
+      ".CCCCC...CCCCCC.",
+      ".CCMCCCCCCCCCSC.",
+      ".CCCCC...CCCCCC.",
+      ".CCWCC...CCCCCCC",
+      ".CCCCS.........C",
+      ".CCCCC.........C",
+      "...............C",
+    ],
+    start: { x: 1, y: 1 },
+    exit: { x: 15, y: 7 },
+    rings: [ { x: 11, y: 3 }, { x: 0, y: 0, hidden: true } ],
+  },
+  {
+    // level9 ("Level 9: Wind 2" in the .esx) — resync: start moved to (1,2), the (4,1) marshmallow
+    // removed, and a second marshmallow added at (6,3) next to the existing one at (5,3). Rain (S)
+    // at (13,1)/(7,5), sun ring at (14,6). No wind-ring tile — relies on hasWind from level8.
+    map: [
+      "..............CC",
+      ".....CCCCCC.CSCC",
+      ".CCCCMCCCCC.CCC.",
+      ".CCCCMMCCC......",
+      "..........CCCCC.",
+      ".CCC.CCSC.CCCCC.",
+      ".CCC.CCCC.CCCCC.",
+      "................",
+    ],
+    start: { x: 1, y: 2 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 14, y: 6 } ],
+  },
+  {
+    // level10 — full resync from level10.esx: reshaped from one big open room into a scalloped
+    // floor plan (each row's floor run a different length), start moved to (1,3), rain (S) at
+    // (1,1)/(12,4)/(14,6)/(0,7), rings unchanged at (8,3)/(8,5), marshmallow at (3,4). (14,0) and
+    // (15,1) opened to floor, connecting the exit directly — no marshmallow bridge needed.
+    // A hidden ring at (2,0) (otile) is deliberately omitted: that cell is a wall with no
+    // panel/switch in this level to ever reveal it — same orphaned-otile artifact as other levels.
+    map: [
+      "CC............CC",
+      ".SCCCCCCCCCCCCCC",
+      ".CCCCCCCCCCCCCC.",
+      ".CCCCCCCCCCCCCC.",
+      ".CCMCCCCCCCCS...",
+      ".CCCCCCCCCCCC...",
+      ".CCCCCCCCCC...S.",
+      "SC........C.....",
+    ],
+    start: { x: 1, y: 3 },
+    exit: { x: 15, y: 0 },
+    rings: [ { x: 8, y: 3 }, { x: 8, y: 5 } ],
+  },
+  {
+    // level11 ("Level 11: Black Unicorn 1" in the .esx) — resync: row1's wall gap is back
+    // (cols 7-8); rows 5-6 reworked with new internal sky gaps ((4,5)/(11,5), (2,6)/(4,6)/(11,6)/
+    // (13,6)) and rain repositioned to (9,5)/(13,5); row6 col15 opened to floor; row7 (the bottom
+    // edge, previously all sky) now has floor corners at (0-1,7) and (14-15,7).
+    map: [
+      "................",
+      ".CCCCCC..CCCCCC.",
+      ".CCCCCSMMSCCCCC.",
+      ".CCCCCCMMCCCCCC.",
+      ".CCCCCSMMCCCCCC.",
+      ".CCC.CCMMSC.CSC.",
+      "SC.C.CCMMCC.C.CC",
+      "CC............CC",
+    ],
+    start: { x: 1, y: 1 },
+    exit: { x: 1, y: 6 },
+    exit2: { x: 14, y: 6 },   // second exit, mirror-unicorn levels only — see resetLevel's EXIT2
+    rings: [ { x: 3, y: 3 } ],
+    bot: { x: 14, y: 1 },
+  },
+  {
+    // level12 ("Level 13: Black Unicorn 3" in the .esx, swapped here 2026-09-12) — the marshmallow
+    // divide is two columns wide (7-8), no hole gap either side of it — pure beam-blocking wall,
+    // nothing to skewer through. Three rain tiles: (6,1)/(10,2)/(13,5). Mirror at (12,3), sun ring
+    // at (5,4).
+    map: [
+      "................",
+      ".CCCCCSMMCCCCCC.",
+      ".CCCCCCMMCSCCCC.",
+      ".CCCCCCMMCCC/CC.",
+      ".CCCCCCMMCCCCCC.",
+      ".CCCCCCMMCCCCSC.",
+      ".CCCCCCMMCCCCCC.",
+      "................",
+    ],
+    start: { x: 1, y: 1 },
+    exit: { x: 1, y: 6 },
+    exit2: { x: 14, y: 6 },   // second exit, mirror-unicorn levels only — see resetLevel's EXIT2
+    rings: [ { x: 5, y: 4 } ],
+    bot: { x: 14, y: 1 },
+  },
+  {
+    // level13 ("Level 12: Black unicorn 2" in the .esx, swapped here 2026-09-12) — the finale:
+    // touching the bot merges the two halves for good (opens the wall at cols 7-8, swaps the
+    // marshmallow at (12,4) for the pot of gold — see altLayer/handleMove), and collecting the pot
+    // ends the whole game. No exit tile at all. The marshmallows at (2,4)/(12,4) are the intended
+    // way across the wall before that — skewer/carry one onto the hole to bridge it, the game's
+    // existing mechanic. A stray otile at (12,3) (T_ON, unmapped) looks like leftover editor
+    // scaffolding — skipped.
+    map: [
+      "CCCCCCC..CCCCCCC",
+      "CCCCCCC..CCCCCCC",
+      "CCCCCCC..CCCCCCC",
+      "CCCCCCC..CCCCCCC",
+      "CCMCCCC..CCCMCCC",
+      "CCCCCCC..CCCCCCC",
+      "CCCCCCC..CCCCCCC",
+      "CCCCCCC..CCCCCCC",
+    ],
+    start: { x: 1, y: 1 },
+    rings: [],   // no exit at all on this level — see comment above
+    altLayer: [   // opens the wall (cols 7-8, every row) and swaps (12,4)'s M for the pot of gold
+      { x: 7, y: 0, tile: 'C' }, { x: 8, y: 0, tile: 'C' },
+      { x: 7, y: 1, tile: 'C' }, { x: 8, y: 1, tile: 'C' },
+      { x: 7, y: 2, tile: 'C' }, { x: 8, y: 2, tile: 'C' },
+      { x: 7, y: 3, tile: 'C' }, { x: 8, y: 3, tile: 'C' },
+      { x: 7, y: 4, tile: 'C' }, { x: 8, y: 4, tile: 'C' },
+      { x: 7, y: 5, tile: 'C' }, { x: 8, y: 5, tile: 'C' },
+      { x: 7, y: 6, tile: 'C' }, { x: 8, y: 6, tile: 'C' },
+      { x: 7, y: 7, tile: 'C' }, { x: 8, y: 7, tile: 'C' },
+      { x: 12, y: 4, tile: 'O' },
+    ],
+    bot: { x: 14, y: 1 },
+  },
+];
+let levelIndex = START_LEVEL;
+// index of the one level with a W tile in its map — used so any later level always has hasWind
+// true regardless of how you got there (level-nav arrows, START_LEVEL), not just real pickup history.
+const WIND_LEVEL = LEVELS.findIndex(l => l.map.some(row => row.includes('W')));
+// set by tryCollectWind, persists across levels — except resetLevel clears it whenever the level
+// being (re)entered still has its own W tile, so restarting level8 re-requires collecting it.
+let hasWind = false;
+let MAP, START, EXIT, EXIT2, RINGS;   // set from LEVELS[levelIndex] each time resetLevel() runs
+const COLS = 16, ROWS = 8;     // every level above is this size — see the note above LEVELS
+
+// --- grid layout on screen ------------------------------------
+// Fixed pixel-perfect grid, sized for the 2x sprite scale and a real (non-overlay) top bar.
+// TOPBAR + CELL*ROWS = 576 exactly; CELL*COLS + 2*margin = 1024 exactly — all integers, no fractional pixels.
+const TOPBAR = 64;             // 64 + 64*8 = 576
+const CELL = 64;               // 64*16 = 1024, zero margin — grid fills the canvas width exactly
+const offX = (W - CELL*COLS) / 2;   // 0
+const offY = TOPBAR;                // grid starts right below the top bar
+
+// --- state ------------------------------------------------------
+let state, msg;
+
+// ===========================================================================
+// ALL PLAYER-FACING TEXT lives in TEXT below — edit it here, nowhere else.
+//   arrays  = rotating pools: say('key') picks one, never the same twice running
+//   strings = fixed lines: shown with  msg = TEXT.key
+// Every line must stay within the bitmap font's charset:  A-Z 0-9 space . , ! ' - ? /
+// The bar always opens each level with levelBrief() (one of the brief* lines) and
+// the idle nudge restores it — so "what do I do" text is identical every time.
+// ===========================================================================
+
+
+const lastLine = {};
+// briefStorm is level1's line only — every later level either introduces something new (see
+// NEW_TILE_BRIEF, first appearance only) or falls back to briefGeneric if it doesn't.
+const NEW_TILE_BRIEF = {
+  2: 'briefMirror', 3: 'briefTeleport', 4: 'briefPanel', 8: 'briefWind', 11: 'briefBot', 13: 'briefFinale',
+};
+// the level's fixed one-line instruction — set by resetLevel, never changes during play
+function levelBrief(){
+  if (state && !state.hasHorn) return TEXT.briefHorn;
+  if (levelIndex === 1) return TEXT.briefStorm;
+  return TEXT[NEW_TILE_BRIEF[levelIndex]] || TEXT.briefGeneric;
+}
+// pick a pool line, avoiding the last pick for that pool and whatever's already on the bar
+function say(key){
+  const a = TEXT[key];
+  let i = Math.random()*a.length|0;
+  for (let n = 0; n < 8 && a.length > 1 && (i === lastLine[key] || a[i] === msg); n++) i = (i+1) % a.length;
+  lastLine[key] = i; msg = a[i];
+}
+
+let gameStarted = false, introShowPrompt = false, introBlinkOn = true, introBlinkTimer = null;
+setTimeout(() => {
+  introShowPrompt = true;
+  introBlinkTimer = setInterval(() => { introBlinkOn = !introBlinkOn; draw(); }, 500);
+  draw();
+}, 3000);
+let history = [];   // JSON snapshots of state, taken before an input action that actually changed something — see withUndo/undo
+// Escape-style: on the solid-ground level a standing object's map char hides the terrain it sits on.
+// state.terrain recovers it so draw() paints the right ground — level0 only (H over path, S over grass).
+const TERRAIN_UNDER = { H: 'D', S: 'G' };
+function resetLevel(){
+  history = [];
+  const lvl = LEVELS[levelIndex];
+  MAP = lvl.map; START = lvl.start; EXIT = lvl.exit; RINGS = lvl.rings;
+  EXIT2 = (lvl.bot && lvl.exit2) ? lvl.exit2 : null;   // second exit — mirror-unicorn levels only, see isExitCell
+  // hasWind persists across levels once earned, but a level that still has its own W tile always
+  // re-requires collecting it (so restarting/revisiting level8 undoes the pickup); any level past
+  // it always has it, regardless of play path (level-nav arrows, START_LEVEL, not just history).
+  if (isWindLevel()) hasWind = false;
+  else if (levelIndex > WIND_LEVEL) hasWind = true;
+  const tiles = MAP.map(row => row.split(''));   // mutable copy — 'C' or 'S' per cell
+  // ground level (level0): horn/storm chars sit on path/grass, not cloud — keep the hidden terrain
+  const groundLvl = tiles.some(row => row.includes('D') || row.includes('G'));
+  const terrain = groundLvl ? tiles.map(row => row.map(c => TERRAIN_UNDER[c] || c)) : null;
+  state = {
+    unicorn: { x: START.x, y: START.y },
+    aimDx: 1, aimDy: 0,           // last direction pressed — where the horn points, sprite flip
+    tiles,
+    terrain,                      // level0 only: char grid of the ground hidden under H/S — see terrainAt/drawGroundTile
+    rings: RINGS.map(r => ({ x: r.x, y: r.y, collected: false, hidden: !!r.hidden })),
+    ammo: 0,          // horn shots available — +1 per ring collected, see handleMove
+    beam: null,           // array of pixel points traveled so far — grows while the beam is animating
+    beamBot: null,        // mirror-unicorn's own beam, fired in lockstep with the player's — see fireHornBeam
+    beamAnimating: false, // true while a fired beam is still traveling — blocks movement/refiring
+    switches: (lvl.switches||[]).map(s => ({ ...s, normalTile: MAP[s.targetY][s.targetX] })),
+    panels: (lvl.panels||[]).map(p => p.swapAt
+      ? { ...p, normalTile: MAP[p.swapAt.y][p.swapAt.x] }   // general swap variant — see syncPanelSwaps
+      : { ...p }),   // ring-reveal variant — button positions -> which ring (by index) they reveal
+    reveals: lvl.reveals || [],   // rain positions with something in the "alt layer" underneath — see fireHornBeam
+    teleports: lvl.teleports || [],   // one-way portal tiles P: {x,y,tx,ty} — see handleMove
+    bot: lvl.bot ? { x: lvl.bot.x, y: lvl.bot.y } : null,   // mirror-unicorn — see moveBotMirror
+    altLayer: lvl.altLayer || [],   // {x,y,tile} cells swapped in wholesale on touching the bot — see handleMove
+    merged: false,    // true once altLayer has been applied — permanently drops the colour inversion
+    won: false,       // true once the win condition (see checkWin) is met — unlocks the exit
+    finished: false,  // true once the unicorn has crossed onto the exit tile
+    hasHorn: !lvl.startsWithoutHorn,  // false only for level0 — see tryCollectHorn
+    saidArk: false, saidHelp: false, saidGoRainbow: false,  // level0 story beats — see attemptMove
+    saidMM: false,    // level1's marshmallow explanation, once the rain first clears — see finishBeam
+    saidWalk: false,  // level1's "walk to it" nudge, the first step taken after saidMM
+    saidCarry: false, // level1's "carry it" follow-up, the first time it's actually skewered
+    rainSlide: null,  // {fromX,fromY,toX,toY,t} while a pushed rain tile's slide animates — see animateRainPush
+  };
+  msg = levelBrief();   // fixed one-line instruction, same every start/restart — see TEXT
+  draw();
+}
+function changeLevel(delta){
+  const next = levelIndex + delta;
+  if (next < 0 || next >= LEVELS.length) return;
+  levelIndex = next;
+  resetLevel();
+}
+
+// undo (Z): snapshots state as JSON before an input action, keeps it only if something changed —
+// a blocked move pushes nothing. Blocked mid-beam-animation, since runBeamTrace reads state live.
+function withUndo(action){
+  const before = JSON.stringify(state);
+  action();
+  if (JSON.stringify(state) !== before){
+    history.push(before);
+    if (history.length > 100) history.shift();   // cap so a long session doesn't grow this forever
+  }
+}
+function undo(){
+  if (state.beamAnimating) return;
+  if (!history.length){ blocked(TEXT.undoNone); return; }
+  state = JSON.parse(history.pop());
+  msg = TEXT.undoDone;
+  draw();
+}
+
+// --- helpers ------------------------------------------------------
+function isAdjacent(a,b){ return Math.abs(a.x-b.x)+Math.abs(a.y-b.y) === 1; }
+function inBounds(x,y){ return x>=0 && x<COLS && y>=0 && y<ROWS; }
+function tileAt(x,y){ return state.tiles[y][x]; }
+// the ground under a standing object — level0 only (state.terrain is null elsewhere); falls back to the tile itself
+function terrainAt(x,y){ return state.terrain ? state.terrain[y][x] : tileAt(x,y); }
+const REFLECTORS = '/\\';            // full mirrors — reflect from all 4 sides, no pass-through
+// in SKEWER_PUSH mode M is off this list — see handleMove's skewer-drag branch
+const PUSHABLE = SKEWER_PUSH ? REFLECTORS : ('M' + REFLECTORS);
+// part of the platform — only sky is not; reflectors sit on a cloud, so they count as path too.
+// true for EXIT, or EXIT2 too on the mirror-unicorn levels that have one (see resetLevel).
+function isExitCell(x,y){
+  return !!(EXIT && x === EXIT.x && y === EXIT.y) || !!(EXIT2 && x === EXIT2.x && y === EXIT2.y);
+}
+// A cloud-level exit is not-path until won so neighbouring clouds scallop toward it and the
+// platform loop skips it, leaving the gap where drawClearing() paints the clearing in the overcast.
+function isPath(x,y){
+  if (!inBounds(x,y)) return false;
+  // cloud-level exit: not-path until won (see drawClearing); level0's exit sits on the solid
+  // sun-beam tile ('D'), which stays drawn
+  if (isExitCell(x,y) && !state.won && tileAt(x,y) === 'C') return false;
+  return tileAt(x,y) !== '.';
+}
+function anyStormsLeft(){
+  return state.tiles.some(row => row.includes('S'));
+}
+function anyRingCollected(){
+  return state.rings.some(r => r.collected);
+}
+function moveUnicornTo(nx, ny){
+  state.unicorn.x = nx;
+  state.unicorn.y = ny;
+}
+// mirror-unicorn: called once per successful player move (see handleMove's three moveUnicornTo
+// call sites, but NOT the teleport-landing one — that's a follow-up repositioning within the same
+// input, not a fresh direction) with the same dx/dy the player just moved by. Horizontal flips
+// (bdx = -dx), vertical doesn't (bdy = dy) — mirrored across the level's own vertical center line.
+// Resolves independently of the player's move: if its mirrored step is blocked, it just stays put
+// this turn, same as any obstacle would block it — no coupling back onto the player's move.
+// Mirrors always push classic-style regardless of SKEWER_PUSH — only M gets the skewer treatment
+// below (state.botSkewered, mirroring state.skewered); the gust (W) is a plain obstacle to it (it
+// can never hold one), rain (S) is hasWind-gated same as the player.
+// avoidX,avoidY (optional): the player's move target this turn (nx,ny from handleMove). Under
+// BOT_MIRROR_ON_BLOCKED this can run before the player's own move resolves, so state.unicorn.x/y
+// alone isn't enough to keep the two from landing on the same cell — the player ends this turn on
+// either their current cell (if blocked) or avoidX/avoidY (if not), so the bot treats both as solid
+function moveBotMirror(dx, dy, avoidX, avoidY){
+  if (!state.bot) return;
+  const bdx = -dx, bdy = dy;
+
+  // continuing a mirrored skewer-drag, or turning away from one — since the bot's direction each
+  // turn is always the exact mirror of the player's, replaying the same same-direction/turn-away
+  // split as attemptMove naturally keeps the two pins in lockstep with no extra bookkeeping.
+  if (state.botSkewered){
+    if (bdx === state.botSkewered.dx && bdy === state.botSkewered.dy) botDragSkewered(bdx, bdy, avoidX, avoidY);
+    else botUnskewerByWalkingAway(bdx, bdy, avoidX, avoidY);
+    return;
+  }
+
+  const tx = state.bot.x + bdx, ty = state.bot.y + bdy;
+  if (!inBounds(tx,ty)) return;
+  if (tx === state.unicorn.x && ty === state.unicorn.y) return;   // the player blocks it too
+  if (tx === avoidX && ty === avoidY) return;   // ...and so does wherever the player is about to step
+  const t = tileAt(tx,ty);
+  if (t === '.' || t === 'W') return;   // sky, gust: impassable to the bot
+  if (t === 'S'){
+    if (!hasWind) return;
+    const land = slideRain(tx, ty, bdx, bdy);
+    if (!land) return;
+    state.tiles[land.y][land.x] = 'S';
+    state.tiles[ty][tx] = 'C';
+    sfxPush();
+    animateRainPush(tx, ty, land.x, land.y);
+  } else if (t === 'M'){
+    // pin on contact, mirroring handleMove's SKEWER_PUSH branch — drag forward this same step
+    // when the tip cell is open, else a stationary in-place skewer (bot doesn't step onto it).
+    const near = { x: tx+bdx, y: ty+bdy };
+    const land = inBounds(near.x,near.y) ? tileAt(near.x,near.y) : null;
+    const canLand = (land === 'C' || land === '.') && !isExitCell(near.x,near.y);
+    if (!canLand){
+      state.botSkewered = { x: tx, y: ty, dx: bdx, dy: bdy };
+      sfxPickup();
+      return;
+    }
+    const onSky = land === '.';
+    state.tiles[ty][tx] = 'C';
+    state.tiles[near.y][near.x] = onSky ? 'C' : 'M';
+    state.botSkewered = onSky ? null : { x: near.x, y: near.y, dx: bdx, dy: bdy };
+    sfxPush();
+  } else if (REFLECTORS.includes(t)){
+    const px = tx+bdx, py = ty+bdy;
+    const pushDest = inBounds(px,py) && !(px === state.unicorn.x && py === state.unicorn.y) && !(px === avoidX && py === avoidY) ? tileAt(px,py) : null;
+    const landTile = pushLanding(t, pushDest);
+    if (landTile === null) return;   // nowhere to push it — bot stays put
+    state.tiles[py][px] = landTile;
+    state.tiles[ty][tx] = 'C';
+    sfxPush();
+  }
+  state.bot.x = tx; state.bot.y = ty;
+
+  // the mirror-unicorn can find sun rings too, same pickup rule as the player, feeding the same
+  // shared ammo pool — a ring might only sit on a cell the bot's mirrored path reaches
+  tryCollectRing(tx, ty);
+}
+// mirrors handleMove's "if (state.skewered)" continue-drag branch: same direction as the pin, so
+// the bot advances into the M's old cell and the M slides one further ahead.
+function botDragSkewered(bdx, bdy, avoidX, avoidY){
+  const pin = state.botSkewered;
+  const tx = state.bot.x + bdx, ty = state.bot.y + bdy;
+  if (tx === state.unicorn.x && ty === state.unicorn.y) return;
+  if (tx === avoidX && ty === avoidY) return;
+  const near = { x: pin.x + bdx, y: pin.y + bdy };
+  const land = inBounds(near.x,near.y) ? tileAt(near.x,near.y) : null;
+  if ((land !== 'C' && land !== '.') || isExitCell(near.x,near.y)) return;   // drag blocked — bot stays put, pin holds
+  const onSky = land === '.';
+  state.tiles[pin.y][pin.x] = 'C';
+  state.tiles[near.y][near.x] = onSky ? 'C' : 'M';
+  state.botSkewered = onSky ? null : { x: near.x, y: near.y, dx: bdx, dy: bdy };
+  state.bot.x = tx; state.bot.y = ty;
+  sfxPush();
+}
+// mirrors unskewerByWalkingAway: the bot's mirrored direction no longer matches the one that
+// pinned its M, so the pin drops and it steps that way instead when the cell is open.
+function botUnskewerByWalkingAway(bdx, bdy, avoidX, avoidY){
+  state.botSkewered = null;
+  const tx = state.bot.x + bdx, ty = state.bot.y + bdy;
+  if (!inBounds(tx,ty)) return;
+  if (tx === state.unicorn.x && ty === state.unicorn.y) return;
+  if (tx === avoidX && ty === avoidY) return;
+  if (!'CX'.includes(tileAt(tx,ty)) || isExitCell(tx,ty)) return;
+  state.bot.x = tx; state.bot.y = ty;
+  tryCollectRing(tx, ty);
+}
+// full mirror reflection — bends every approach direction, never passes through
+function reflect(t, dx, dy){
+  return t === '/' ? [-dy,-dx] : [dy,dx];
+}
+function triggerSwitch(x, y){
+  const sw = state.switches.find(s => s.x===x && s.y===y);
+  if (!sw) return;
+  const cur = tileAt(sw.targetX, sw.targetY);
+  state.tiles[sw.targetY][sw.targetX] = cur === sw.altTile ? sw.normalTile : sw.altTile;
+}
+// button weight: true while the unicorn is standing on it, or a marshmallow is resting on it —
+// live, not sticky, so the ring it reveals hides again the instant both leave (see isRingVisible).
+// Only the unicorn itself or a marshmallow counts as weight.
+function panelWeighted(x, y){
+  return (state.unicorn.x === x && state.unicorn.y === y) || tileAt(x,y) === 'M';
+}
+// a hidden ring is visible/collectible whenever any button wired to it (level.panels, matched by
+// ring index) currently has weight on it — recomputed every draw/move, nothing is stored.
+// level0: the sun beam stays absent until the horse finds its horn (hasHorn is true everywhere else).
+function isRingVisible(i){
+  const r = state.rings[i];
+  if (!state.hasHorn) return false;
+  return !r.hidden || state.panels.some(p => p.ring === i && panelWeighted(p.x, p.y));
+}
+// general-purpose panel variant, straight from Escape's real T_PANEL: while weighted, the target
+// cell shows altTile; unweighted, it reverts to normalTile (captured from the original map in
+// resetLevel) — e.g. a hole that opens into floor while something rests on the panel. Live, not
+// sticky, same as the ring-reveal variant; re-synced every draw() and at the top of handleMove
+// so blocking checks see the current state, not last frame's
+function syncPanelSwaps(){
+  for (const p of state.panels){
+    if (!p.swapAt) continue;
+    // only toggle between the two tiles the panel owns — never stomp a marshmallow the player
+    // parked on the swap cell
+    const cur = state.tiles[p.swapAt.y][p.swapAt.x];
+    if (cur !== p.altTile && cur !== p.normalTile) continue;
+    state.tiles[p.swapAt.y][p.swapAt.x] = panelWeighted(p.x, p.y) ? p.altTile : p.normalTile;
+  }
+}
+// pure geometry, no side effects — the cell-by-cell path the beam will travel, so it can be
+// animated and applied one step at a time instead of resolving instantly. Bends through
+// reflectors exactly like the old fireBeam did; stops at a marshmallow or the grid edge
+// ('exited'), a closed loop elsewhere ('looped'), or it loops back onto the unicorn's own tile
+// or the cell it was fired from ('returned' — the light found its way home).
+function teleportAt(x, y){
+  return state.teleports.find(t => (t.x===x && t.y===y) || (t.tx===x && t.ty===y));
+}
+// the far end of a teleport pair from whichever end (x,y) is
+function teleportOther(tp, x, y){
+  return (tp.x===x && tp.y===y) ? {x:tp.tx, y:tp.ty} : {x:tp.x, y:tp.y};
+}
+// origin defaults to the player, so the "circled back and hit the shooter" check still works for
+// the player's own beam; the mirror-unicorn's beam passes its own position instead, see fireHornBeam.
+// hx,hy (optional): the other unicorn's position — the beam stops dead the instant it reaches it,
+// same as the two beams meeting each other, see finishBeam
+function traceBeamPath(x, y, dx, dy, ox=state.unicorn.x, oy=state.unicorn.y, hx, hy){
+  const startX = x, startY = y;
+  const path = [];
+  const seen = new Set();
+  let outcome = 'exited', first = true, justJumped = false;
+  while (inBounds(x,y) && tileAt(x,y) !== 'M'){
+    if (x === ox && y === oy){ outcome = 'returned'; break; }   // circled back and hit the shooter
+    if (!first && x === startX && y === startY){ outcome = 'returned'; break; }
+    if (x === hx && y === hy){ outcome = 'hit'; path.push({x, y, jump: justJumped}); break; }   // reaches the other unicorn — stops there
+    const key = x+','+y+','+dx+','+dy;
+    if (seen.has(key)){ outcome = 'looped'; break; }
+    seen.add(key);
+    first = false;
+    path.push({x, y, jump: justJumped});   // jump: this point reappears here — don't draw a line from the previous point
+    const cameFromJump = justJumped;   // just arrived via a portal — don't immediately bounce back out the way we came
+    justJumped = false;
+    const t = tileAt(x,y);
+    if (REFLECTORS.includes(t)){
+      const r = reflect(t,dx,dy);
+      if (r){ dx=r[0]; dy=r[1]; }
+    }
+    if (t === 'P' && !cameFromJump){
+      const tp = teleportAt(x,y);
+      if (tp){
+        const dest = teleportOther(tp, x, y);
+        x = dest.x; y = dest.y;
+        justJumped = true;
+        continue;   // already "moved" via the jump — skip the dx/dy step this iteration
+      }
+    }
+    x += dx; y += dy;
+  }
+  return { path, outcome };
+}
+function checkWin(){
+  return !anyStormsLeft() && anyRingCollected();
+}
+function cellCenter(x,y){
+  return { cx: offX + x*CELL + CELL/2, cy: offY + y*CELL + CELL/2 };
+}
+
+// --- drawing ------------------------------------------------------
+function drawRainCloud(cx, cy, size){
+  if (!atlasLoaded) return;
+  const r = ATLAS_RAIN_CLOUD;
+  ctx.drawImage(atlas, r.x, r.y, r.w, r.h, cx-size/2, cy-size/2, size, size);
+}
+function textWidth(upperStr, scale){
+  let w = 0;
+  for (const c of upperStr) w += (c === ' ' ? SPACE_ADV : GLYPHS[c][6]) * scale;
+  return w;
+}
+// bitmap-font text: uppercases, walks glyph-by-glyph from the atlas. Returns false (drawing
+// nothing) if any character isn't in GLYPHS, so the caller can fall back to ctx.fillText instead.
+// Always draws white (baked into the atlas) — ctx.fillStyle has no effect here, unlike fillText.
+function drawText(str, x, y, opts){
+  opts = opts || {};
+  const scale = opts.scale || TEXT_SCALE;
+  const up = str.toUpperCase();
+  for (const c of up) if (c !== ' ' && !GLYPHS[c]) return false;
+  if (!atlasLoaded) return false;
+  const w = textWidth(up, scale);
+  let cx = opts.align === 'center' ? x - w/2 : opts.align === 'right' ? x - w : x;
+  const ty = opts.baseline === 'middle' ? y - GLYPH_H*scale/2 : y;
+  for (const c of up){
+    if (c === ' '){ cx += SPACE_ADV*scale; continue; }
+    const [gx,gy,gw,gh,xo,yo,adv] = GLYPHS[c];
+    ctx.drawImage(atlas, gx, gy, gw, gh, cx+xo*scale, ty+yo*scale, gw*scale, gh*scale);
+    cx += adv*scale;
+  }
+  return true;
+}
+// intro title only: drawText's glyphs are baked white, so each letter gets its own hue here via a
+// small offscreen tint (source-in) instead — a one-off, not worth generalizing into drawText.
+function drawRainbowTitle(str, x, y, scale){
+  const up = str.toUpperCase();
+  let cx = x - textWidth(up, scale)/2;
+  const ty = y - GLYPH_H*scale/2;
+  const letterCount = [...up].filter(c => c !== ' ').length;
+  let li = 0;
+  for (const c of up){
+    if (c === ' '){ cx += SPACE_ADV*scale; continue; }
+    const [gx,gy,gw,gh,xo,yo,adv] = GLYPHS[c];
+    const tmp = document.createElement('canvas');
+    tmp.width = gw; tmp.height = gh;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(atlas, gx, gy, gw, gh, 0, 0, gw, gh);
+    tctx.globalCompositeOperation = 'source-in';
+    tctx.fillStyle = `hsl(${li/letterCount*360},80%,60%)`;
+    tctx.fillRect(0, 0, gw, gh);
+    ctx.drawImage(tmp, cx+xo*scale, ty+yo*scale, gw*scale, gh*scale);
+    cx += adv*scale;
+    li++;
+  }
+}
+// segments: array of point-arrays — a new segment starts at each teleport jump, so the beam
+// visually vanishes at one portal and reappears at the other instead of drawing a straight line
+// connecting them
+function drawBeam(segments){
+  ctx.save();
+  ctx.strokeStyle = '#fff4b8';
+  ctx.shadowColor = '#ffe066';
+  ctx.shadowBlur = 14;
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const seg of segments){
+    if (seg.length < 2) continue;
+    ctx.beginPath();
+    ctx.moveTo(seg[0].x, seg[0].y);
+    for (let i=1; i<seg.length; i++) ctx.lineTo(seg[i].x, seg[i].y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawRing(cx, cy, r){
+  if (!atlasLoaded) return;
+  const size = r*2.6*2;
+  const s = ATLAS_SUN;
+  ctx.drawImage(atlas, s.x, s.y, s.w, s.h, cx-size/2, cy-size/2, size, size);
+}
+// the gust pickup — 3 lines of a weather-icon breeze, not a ring shape, so it reads as wind
+// itself rather than a recolored pickup.
+function drawGust(cx, cy, r){
+  ctx.save();
+  ctx.strokeStyle = '#6fb8dd';
+  ctx.lineCap = 'round';
+  ctx.lineWidth = Math.max(2, r*0.2);
+  ctx.beginPath();
+  const turns = 1.6, steps = 24;
+  for (let i = 0; i <= steps; i++){
+    const t = i/steps;
+    const angle = t*turns*Math.PI*2;
+    const rad = r*(0.15 + 0.85*t);
+    const x = cx + Math.cos(angle)*rad, y = cy + Math.sin(angle)*rad;
+    if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+function drawMarshmallow(cx, cy, size){
+  if (!atlasLoaded) return;
+  // size is the full on-screen footprint (CELL for a standing tile — fills the block edge to
+  // edge, like the cloud tiles do — or a smaller pre-shrunk value for the horn-carried icon)
+  const m = ATLAS_MM;
+  ctx.drawImage(atlas, m.x, m.y, m.w, m.h, cx-size/2, cy-size/2, size, size);
+}
+// an elongated glass lens (not just a line) angled along the mirror's diagonal — a gradient body
+// plus a small glint sells the "glass", dark edges keep it visible on a light cloud (see feedback).
+function drawReflector(cx, cy, size, t){
+  const slash = (t === '/');
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(slash ? -Math.PI/4 : Math.PI/4);
+  const rx = size*0.4, ry = size*0.13;
+  const g = ctx.createLinearGradient(-rx, 0, rx, 0);
+  g.addColorStop(0, '#0d2c54'); g.addColorStop(0.5, '#6fb3e6'); g.addColorStop(1, '#0d2c54');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#0d2c54'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.65)';
+  ctx.beginPath(); ctx.ellipse(-rx*0.3, -ry*0.3, rx*0.3, ry*0.35, 0, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawSwitch(cx, cy, size){
+  ctx.save();
+  ctx.fillStyle = '#c9a0ff';
+  ctx.beginPath();
+  ctx.arc(cx, cy, size*0.16, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = '#8a5fd6'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.restore();
+}
+// button — a small cloud-pillow tuft, flattened; dim while unpressed, warm-gold once triggered
+function drawButton(cx, cy, size, active){
+  ctx.save();
+  if (active){ ctx.shadowColor = '#ffe066'; ctx.shadowBlur = size*0.12; }
+  ctx.fillStyle = active ? '#ffe9a8' : '#cfc9c2';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, size*0.22, size*0.13, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = active ? '#e0a94a' : '#a29c95';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.restore();
+}
+// teleport — a small swirl of concentric rings, alternating colors, evoking a portal without needing new art
+function drawTeleport(cx, cy, size){
+  ctx.save();
+  ctx.shadowColor = '#c9a0ff'; ctx.shadowBlur = size*0.15;
+  for (let i=0; i<3; i++){
+    ctx.beginPath();
+    ctx.arc(cx, cy, size*(0.24 - i*0.07), 0, Math.PI*2);
+    ctx.strokeStyle = i%2===0 ? '#c9a0ff' : '#7fd3ff';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+// picks which of clouds2.png's 9 sub-tiles fits a cell, from which neighbors are open sky —
+// corner when an open vertical side (top/bottom) meets an open horizontal side (left/right),
+// edge for a single open side, center when fully enclosed by more cloud. A cell open on 3+ sides
+// (rare — a full blob-autotile would need many more tiles for that) just takes the first match.
+function cloudTileIndex(x, y){
+  return {
+    openTop: !isPath(x,y-1), openBottom: !isPath(x,y+1),
+    openLeft: !isPath(x-1,y), openRight: !isPath(x+1,y),
+  };
+}
+// clouds2.png is a 3x3 sheet (4 corners, 4 edges, center). A single tile can only show a puffy
+// edge on ONE side, so a cell open on both opposite sides (a 1-thick strip, or an isolated cell)
+// gets split into up to 2x2 quadrants — each an independent half/quarter crop of whichever edge
+// or corner tile matches that quadrant, so both opposite edges render instead of one flat side.
+// (A fully-uniform always-4-quadrants version was tried and reverted — it added a visible seam to
+// every ordinary cell, including fully-enclosed ones, for no benefit over splitting only when needed.)
+function drawCloudTile(x, y){
+  if (!atlasLoaded) return;
+  const px = offX+x*CELL, py = offY+y*CELL;
+  const { openTop, openBottom, openLeft, openRight } = cloudTileIndex(x, y);
+  const half = CLOUD_TILE/2, halfCell = CELL/2;
+  const vParts = (openTop && openBottom)
+    ? [{ row:0, sy:0, dy:py, sh:half, dh:halfCell }, { row:2, sy:half, dy:py+halfCell, sh:half, dh:halfCell }]
+    : [{ row: openTop?0:openBottom?2:1, sy:0, dy:py, sh:CLOUD_TILE, dh:CELL }];
+  const hParts = (openLeft && openRight)
+    ? [{ col:0, sx:0, dx:px, sw:half, dw:halfCell }, { col:2, sx:half, dx:px+halfCell, sw:half, dw:halfCell }]
+    : [{ col: openLeft?0:openRight?2:1, sx:0, dx:px, sw:CLOUD_TILE, dw:CELL }];
+  for (const v of vParts) for (const h of hParts){
+    ctx.drawImage(atlas, ATLAS_CLOUD.x+h.col*CLOUD_TILE+h.sx, ATLAS_CLOUD.y+v.row*CLOUD_TILE+v.sy,
+      h.sw, v.sh, h.dx, v.dy, h.dw, v.dh);
+  }
+}
+// the cloud-level exit before it's won: a clearing in the overcast — cloud curled back into a ring
+// around a patch of calm, lit sky. Not a rainbow on purpose; the arc is the reveal on win.
+function drawClearing(cx, cy, size){
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, size*0.46);
+  g.addColorStop(0, '#eef2fb'); g.addColorStop(1, 'rgba(169,205,236,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(cx, cy, size*0.46, 0, Math.PI*2); ctx.fill();
+}
+// level0's ground: flat colors, no 9-slice mesh. Reads terrainAt (storm cell = the grass it hides,
+// horn cell = path); grass gets the grass.png texture only where it borders the path, else flat.
+function drawGroundTile(x, y){
+  const px = offX+x*CELL, py = offY+y*CELL;
+  const isGrass = terrainAt(x,y) === 'G';
+  ctx.fillStyle = isGrass ? '#6abe30' : '#8f563b';
+  ctx.fillRect(px, py, CELL, CELL);
+  if (!isGrass || !atlasLoaded) return;
+  // grass.png's wavy fringe faces up by default — rotate it to face whichever side actually
+  // touches the path (drawn once per touching side, so a corner cell gets more than one fringe).
+  const g = ATLAS_GRASS, cx = px+CELL/2, cy = py+CELL/2;
+  const sides = [[0,-1,0], [0,1,Math.PI], [-1,0,-Math.PI/2], [1,0,Math.PI/2]];
+  for (const [dx,dy,rot] of sides){
+    if (inBounds(x+dx,y+dy) && terrainAt(x+dx,y+dy) === 'D'){
+      ctx.save();
+      ctx.translate(cx, cy); ctx.rotate(rot);
+      ctx.drawImage(atlas, g.x, g.y, g.w, g.h, -CELL/2, -CELL/2, CELL, CELL);
+      ctx.restore();
+    }
+  }
+}
+// side view only: draws the headless body, then exactly one head piece on top — never both a
+// normal and skewer head at once, since their outlines don't pixel-align (see ATLAS_HEAD_NORMAL).
+function drawUnicornSide(head, drawSize, showHorn){
+  ctx.drawImage(atlas, ATLAS_BODY.x, ATLAS_BODY.y, ATLAS_BODY.w, ATLAS_BODY.h, -drawSize/2, -drawSize/2, drawSize, drawSize);
+  ctx.drawImage(atlas, head.x, head.y, head.w, head.h,
+    -drawSize/2 + head.headX*SPRITE_SCALE, -drawSize/2 + head.headY*SPRITE_SCALE,
+    head.w*SPRITE_SCALE, head.h*SPRITE_SCALE);
+  if (showHorn){
+    const h = ATLAS_HORN_SIDE;
+    ctx.drawImage(atlas, h.x, h.y, h.w, h.h,
+      -drawSize/2 + (head.headX+h.offX)*SPRITE_SCALE, -drawSize/2 + (head.headY+h.offY)*SPRITE_SCALE,
+      h.w*SPRITE_SCALE, h.h*SPRITE_SCALE);
+  }
+}
+
+// word-wraps using GLYPHS' own advances (not ctx.measureText) — this text is bitmap-font only.
+function wrapGlyphText(text, maxWidth, scale){
+  const words = text.toUpperCase().split(' ');
+  const lines = [];
+  let line = '';
+  for (const w of words){
+    const test = line ? line+' '+w : w;
+    if (textWidth(test, scale) > maxWidth && line){ lines.push(line); line = w; }
+    else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function drawIntro(){
+  ctx.fillStyle = '#1a1a35';
+  ctx.fillRect(0,0,W,H);
+  if (!atlasLoaded) return;
+  drawRainbowTitle(TEXT.introTitle, W/2, 90, 4);
+  const storyScale = 2, lineH = GLYPH_H*storyScale + 6;
+  const lines = wrapGlyphText(TEXT.introStory, 800, storyScale);
+  lines.forEach((line, i) => drawText(line, W/2, 150 + i*lineH, {align:'center', scale:storyScale}));
+  if (introShowPrompt){
+    const ctrlY = 150 + lines.length*lineH + 30, ctrlLineH = lineH + 10;
+    TEXT.introControls.forEach((line, i) => drawText(line, W/2, ctrlY + i*ctrlLineH, {align:'center', scale:storyScale}));
+    if (introBlinkOn){
+      drawText(TEXT.introPrompt, W/2, H-60, {align:'center', baseline:'middle', scale:3});
+    }
+  }
+}
+function draw(){
+  if (!gameStarted){ drawIntro(); return; }
+  syncPanelSwaps();
+  ctx.clearRect(0,0,W,H);
+  // the whole frame renders desaturated until the horse finds its horn (level0 only — every other
+  // level starts with hasHorn true already) — colour and music (see tryCollectHorn) arrive together.
+  ctx.filter = !state.hasHorn ? 'grayscale(1)' : 'none';
+
+  // top bar: solid strip above the grid (not an overlay) — plenty of room to read
+  ctx.fillStyle = '#0d0d1a';
+  ctx.fillRect(0,0,W,TOPBAR);
+  // leprechaun narrator portrait — sits before the message text it "speaks", text starts after it
+  const LEP_SCALE = 3;
+  let textX = 16;
+  if (atlasLoaded){
+    const lep = ATLAS_LEPRECHAUN;
+    ctx.drawImage(atlas, lep.x, lep.y, lep.w, lep.h, 16, (TOPBAR-lep.h*LEP_SCALE)/2, lep.w*LEP_SCALE, lep.h*LEP_SCALE);
+    textX = 16 + lep.w*LEP_SCALE + 10;
+  }
+
+  ctx.fillStyle = '#fff';
+  if (atlasLoaded && !drawText(msg, textX, TOPBAR/2, {align:'left', baseline:'middle'})){
+    ctx.font = '20px sans-serif';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(msg, textX, TOPBAR/2);
+  }
+  // level readout — just the current level number; nav is keyboard-only now (N/P), see keydown
+  ctx.fillStyle = '#fff';
+  if (atlasLoaded && !drawText(`LEVEL ${levelIndex}`, W-27, TOPBAR/2+1, {align:'right', baseline:'middle'})){
+    ctx.font = '16px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(`LEVEL ${levelIndex}`, W-27, TOPBAR/2+1);
+  }
+
+  // ammo counter — horn shots remaining, only shown once at least one has ever been available
+  if (state.ammo > 0 || anyRingCollected()){
+    drawRing(W-180, TOPBAR/2, 6);   // sun icon, immediately left of the count
+    ctx.fillStyle = '#ffe066';
+    const ammoStr = 'X' + state.ammo;
+    if (atlasLoaded && !drawText(ammoStr, W-165, TOPBAR/2+1, {align:'right', baseline:'middle'})){
+      ctx.font = '18px sans-serif';
+      ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      ctx.fillText(ammoStr, W-165, TOPBAR/2+1);
+    }
+  }
+
+  // wind-power icon — sits left of the sun icon, shown once hasWind is set (see resetLevel)
+  if (hasWind) drawGust(W-215, TOPBAR/2, 10);
+
+  // sky behind everything — one flat fill for the whole grid, no per-cell seams; the cloud
+  // platform (cloud + storm tiles) floats on top of it
+  ctx.fillStyle = '#4a7fc9';
+  ctx.fillRect(offX, offY, CELL*COLS, CELL*ROWS);
+  for (let y=0; y<ROWS; y++){
+    for (let x=0; x<COLS; x++){
+      if (!isPath(x,y)) continue;   // includes the not-yet-won exit tile, see isPath
+      // level0: a horn/storm cell paints the ground it hides (path/grass), not a cloud puff — see terrainAt
+      const base = 'HS'.includes(tileAt(x,y)) ? terrainAt(x,y) : tileAt(x,y);
+      if (base === 'G' || base === 'D') drawGroundTile(x,y);   // level0's ground, not cloud
+      else drawCloudTile(x,y);
+    }
+  }
+
+  // rain tiles — dark and rainy, cleared by the horn's beam (see fireBeam), not by walking in.
+  // A tile mid-slide (see animateRainPush) is skipped here and drawn interpolated below instead,
+  // since state.tiles already holds its final landed position the instant it's pushed.
+  for (let y=0; y<ROWS; y++){
+    for (let x=0; x<COLS; x++){
+      if (tileAt(x,y) !== 'S') continue;
+      if (state.rainSlide && x === state.rainSlide.toX && y === state.rainSlide.toY) continue;
+      const {cx,cy} = cellCenter(x,y);
+      drawRainCloud(cx, cy, CELL);
+    }
+  }
+  if (state.rainSlide){
+    const rs = state.rainSlide;
+    const a = cellCenter(rs.fromX, rs.fromY), b = cellCenter(rs.toX, rs.toY);
+    drawRainCloud(a.cx + (b.cx-a.cx)*rs.t, a.cy + (b.cy-a.cy)*rs.t, CELL);
+  }
+
+  // level0 only: the horn pickup, before the horse finds it — see tryCollectHorn
+  for (let y=0; y<ROWS && atlasLoaded; y++){
+    for (let x=0; x<COLS; x++){
+      if (tileAt(x,y) !== 'H') continue;
+      const {cx,cy} = cellCenter(x,y);
+      const h = ATLAS_HORN;
+      ctx.drawImage(atlas, h.x, h.y, h.w, h.h, cx-CELL*0.4, cy-CELL*0.4, CELL*0.8, CELL*0.8);
+    }
+  }
+
+  // pot of gold ('O') — the altLayer finale collectible (level12 test, see tryCollectPot).
+  // Placeholder icon, no atlas sprite yet.
+  for (let y=0; y<ROWS; y++){
+    for (let x=0; x<COLS; x++){
+      if (tileAt(x,y) !== 'O') continue;
+      const {cx,cy} = cellCenter(x,y);
+      ctx.font = Math.round(CELL*0.6)+'px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('🏺', cx, cy);
+    }
+  }
+
+  // buttons — sit under whatever's on their cell (drawn by coordinate, not a map tile, so a
+  // marshmallow resting on one never overwrites it); lit while weighted, see panelWeighted
+  for (const p of state.panels){
+    const {cx,cy} = cellCenter(p.x, p.y);
+    drawButton(cx, cy, CELL, panelWeighted(p.x, p.y));
+  }
+
+  // marshmallow (M) and the gust (W) as standing objects on top of the base tile
+  for (let y=0; y<ROWS; y++){
+    for (let x=0; x<COLS; x++){
+      const t = tileAt(x,y);
+      if (t !== 'M' && t !== 'W') continue;
+      const {cx,cy} = cellCenter(x,y);
+      if (t === 'W') drawGust(cx, cy, CELL*0.3);
+      else drawMarshmallow(cx, cy, CELL);
+    }
+  }
+
+
+  for (let y=0; y<ROWS; y++){
+    for (let x=0; x<COLS; x++){
+      const t = tileAt(x,y);
+      const {cx,cy} = cellCenter(x,y);
+      if (t === 'X') drawSwitch(cx, cy, CELL);
+      else if (t === 'P') drawTeleport(cx, cy, CELL);
+      else if (REFLECTORS.includes(t)) drawReflector(cx, cy, CELL, t);
+    }
+  }
+
+  // the exit — a clearing in the overcast on cloud levels (level0's exit sits on solid ground, so
+  // it stays bare) marks the spot without spoiling the payoff; on win the rainbow blooms across it.
+  // Drawn at both exits when EXIT2 is set (mirror-unicorn levels only, see resetLevel).
+  for (const e of [EXIT, EXIT2].filter(Boolean)){
+    const {cx,cy} = cellCenter(e.x, e.y);
+    if (state.won){
+      ctx.save();
+      ctx.font = Math.round(CELL*0.9)+'px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('🌈', cx, cy);
+      ctx.restore();
+    } else if (tileAt(e.x, e.y) === 'C'){
+      drawClearing(cx, cy, CELL);
+    }
+  }
+
+  // the sun rings — each sits on the clouds until collected (hidden ones need a weighted button)
+  state.rings.forEach((r, i) => {
+    if (r.collected || !isRingVisible(i)) return;
+    const {cx,cy} = cellCenter(r.x, r.y);
+    drawRing(cx, cy, CELL*0.18);
+  });
+
+  // unicorn (fixed 3x pixel-perfect scale, flips to face aim direction)
+  const {cx:ucx, cy:ucy} = cellCenter(state.unicorn.x, state.unicorn.y);
+  const drawSize = SPRITE_SIZE;
+
+  // mirror-unicorn — same sprites, mirrored off the player's own aim (see moveBotMirror); shows
+  // the skewer head while state.botSkewered is set, same as the player's own carrying state
+  if (state.bot && atlasLoaded){
+    const {cx:bcx, cy:bcy} = cellCenter(state.bot.x, state.bot.y);
+    const botAimDx = -state.aimDx, botAimDy = state.aimDy;
+    ctx.save();
+    ctx.translate(Math.round(bcx), Math.round(bcy));
+    if (botAimDx < 0) ctx.scale(-1,1);
+    // color-inverted so the mirror-unicorn reads apart from the player at a glance — but skip it
+    // when standing in the right half (that half gets inverted wholesale below, so both would
+    // cancel out) or once merged, since the mirror-world distinction is gone for good by then
+    if (bcx < W/2 && !state.merged) ctx.filter = 'invert(1)';
+    if (botAimDy === 0) drawUnicornSide(state.botSkewered ? ATLAS_HEAD_SKEWER : ATLAS_HEAD_NORMAL, drawSize, !state.botSkewered);
+    else {
+      const botFacing = botAimDy > 0 ? ATLAS_UNICORN_FRONT : ATLAS_UNICORN_BACK;
+      ctx.drawImage(atlas, botFacing.x, botFacing.y, botFacing.w, botFacing.h, -drawSize/2, -drawSize/2, drawSize, drawSize);
+      const bh = botAimDy > 0 ? ATLAS_HORN_FRONT : ATLAS_HORN_BACK;
+      ctx.drawImage(atlas, bh.x, bh.y, bh.w, bh.h, -drawSize/2 + bh.offX*SPRITE_SCALE, -drawSize/2 + bh.offY*SPRITE_SCALE, bh.w*SPRITE_SCALE, bh.h*SPRITE_SCALE);
+    }
+    ctx.restore();
+  }
+
+  if (atlasLoaded){
+    // side view (aimDy===0) picks the normal or extended-horn (carrying) head — both are natively
+    // hornless; ATLAS_HORN_SIDE/FRONTBACK draw the horn back on top only while hasHorn is true.
+    const carrying = !!state.skewered;
+    ctx.save();
+    ctx.translate(Math.round(ucx), Math.round(ucy));
+    if (state.aimDx < 0) ctx.scale(-1,1);
+    if (state.aimDy === 0){
+      const head = carrying ? ATLAS_HEAD_SKEWER : ATLAS_HEAD_NORMAL;
+      drawUnicornSide(head, drawSize, !carrying && state.hasHorn);
+    } else {
+      const facing = state.aimDy > 0 ? ATLAS_UNICORN_FRONT : ATLAS_UNICORN_BACK;
+      ctx.drawImage(atlas, facing.x, facing.y, facing.w, facing.h, -drawSize/2, -drawSize/2, drawSize, drawSize);
+      if (state.hasHorn){
+        const h = state.aimDy > 0 ? ATLAS_HORN_FRONT : ATLAS_HORN_BACK;
+        ctx.drawImage(atlas, h.x, h.y, h.w, h.h, -drawSize/2 + h.offX*SPRITE_SCALE, -drawSize/2 + h.offY*SPRITE_SCALE, h.w*SPRITE_SCALE, h.h*SPRITE_SCALE);
+      }
+    }
+    ctx.restore();
+  }
+
+  // the horn's beam — a brief flash from the last shot fired, cleared on a timer (see fireHornBeam)
+  if (state.beam) drawBeam(state.beam);
+  if (state.beamBot) drawBeam(state.beamBot);
+
+  // mirror-unicorn levels: invert the right half of the whole screen (grid + top bar) as a
+  // constant reminder you're in mirrored territory — drops for good once merged (see handleMove)
+  if (state.bot && !state.merged){
+    ctx.globalCompositeOperation = 'difference';
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(W/2, 0, W/2, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.filter = 'none';   // don't let the pre-horn grayscale leak past this frame
+}
+
+// --- game logic ------------------------------------------------------
+function vacate(x, y){ state.tiles[y][x] = 'C'; }
+// shared tail of handleMove's many "can't do that" branches — text is optional since some
+// callers (e.g. say('sky')) already set msg themselves before calling this.
+function blocked(text){ if (text) msg = text; sfxBlocked(); draw(); }
+// after a successful moveUnicornTo when BOT_MIRROR_ON_BLOCKED=true (the default), the bot's
+// mirrored step already fired unconditionally near the top of handleMove — see its own comment.
+function botFollow(dx, dy){ if (!BOT_MIRROR_ON_BLOCKED) moveBotMirror(dx, dy); }
+// shared by handleMove's PUSHABLE branch and moveBotMirror: what a pushed M/mirror becomes at
+// its destination. Only M can bridge a gap (spent into plain cloud); a mirror pushed onto sky
+// would otherwise just sit there as a permanent, non-walkable obstacle — so that's refused.
+function pushLanding(tile, dest){
+  if (dest === 'C') return tile;
+  if (dest === '.' && tile === 'M') return 'C';
+  return null;
+}
+// slides a rain tile at (x,y) in direction (dx,dy) as far as it'll go onto plain cloud (the old
+// gustWind's slide loop) — shared by the player's rain-push and the bot's mirrored one.
+function slideRain(x, y, dx, dy){
+  let px = x, py = y;
+  while (true){
+    const tx = px+dx, ty = py+dy;
+    if (!inBounds(tx,ty) || tileAt(tx,ty) !== 'C') break;
+    px = tx; py = ty;
+  }
+  return (px === x && py === y) ? null : { x: px, y: py };
+}
+// purely cosmetic: state.tiles already holds the rain's final landed position by the time this
+// runs, so there's nothing to block/lock — just a few draw() steps sliding the sprite to match.
+function animateRainPush(fromX, fromY, toX, toY){
+  state.rainSlide = { fromX, fromY, toX, toY, t: 0 };
+  const step = () => {
+    state.rainSlide.t += 0.25;
+    if (state.rainSlide.t >= 1){ state.rainSlide = null; draw(); return; }
+    draw();
+    setTimeout(step, 40);
+  };
+  setTimeout(step, 40);
+}
+// shared by the skewer-drag and walk-into-M branches: where a dragged/pushed M actually lands,
+// redirecting through a portal one cell past it if the landing cell is a teleport.
+function resolveLanding(near, dx, dy){
+  let x = near.x, y = near.y, ported = false;
+  const tp = inBounds(x,y) && tileAt(x,y) === 'P' && teleportAt(x,y);
+  if (tp){ const d = teleportOther(tp, x, y); x = d.x + dx; y = d.y + dy; ported = true; }
+  return { x, y, ported };
+}
+function handleMove(nx, ny){
+  syncPanelSwaps();   // so this move's blocking checks see the current swap state, not last frame's
+  if (state.finished || state.beamAnimating) return;
+  if (!isAdjacent(state.unicorn, {x:nx,y:ny})) return;
+  if (!inBounds(nx,ny)) return;
+
+  const dx = nx - state.unicorn.x;
+  const dy = ny - state.unicorn.y;
+  state.aimDx = dx; state.aimDy = dy;   // always updates, even if this move ends up blocked
+
+  // BOT_MIRROR_ON_BLOCKED: the bot gets its mirrored attempt on every directional input, whether
+  // or not the player's own move ends up blocked below — see the flag's definition up top for the
+  // false/legacy behavior, restored via the three later moveBotMirror calls in that case instead
+  if (BOT_MIRROR_ON_BLOCKED) moveBotMirror(dx, dy, nx, ny);
+
+  // mirror-unicorn: harmless solid obstacle, blocks like a wall in either direction — see
+  // moveBotMirror for its own movement, mirrored off this same dx/dy once your move resolves
+  if (state.bot && nx === state.bot.x && ny === state.bot.y){
+    // touching the bot on a level with an altLayer merges the two halves for good: the colour
+    // inversion drops permanently (see draw's state.merged check) and the listed cells flip.
+    if (state.altLayer.length && !state.merged){
+      state.merged = true;
+      state.bot = null;   // the two unicorns become one — no more mirrored double
+      state.botSkewered = null;
+      for (const a of state.altLayer) state.tiles[a.y][a.x] = a.tile;
+      msg = TEXT.mergeDone;
+      sfxWin();
+      draw();
+      return;
+    }
+    blocked(TEXT.botBlock); return;
+  }
+
+  // Dragging a skewered marshmallow one cell ahead. Far end must be cloud, sky, or a portal
+  // (flung out the far end, one cell on, carry ends). Spent on sky -> plain cloud C.
+  if (state.skewered){
+    const dragFrom = state.skewered;
+    const near = { x: nx + dx, y: ny + dy };
+    const { x: landX, y: landY, ported } = resolveLanding(near, dx, dy);
+    const land = inBounds(landX,landY) ? tileAt(landX,landY) : null;
+    const onExit = isExitCell(nx,ny) || isExitCell(landX,landY);
+    if (onExit || (land !== 'C' && land !== '.')){
+      blocked(TEXT.noPush); return;
+    }
+    const onSky = land === '.';
+    vacate(dragFrom.x, dragFrom.y);
+    if (onSky){
+      state.tiles[landY][landX] = 'C';   // marshmallow spent, gap is now ordinary cloud
+      moveUnicornTo(nx, ny);
+      botFollow(dx, dy);
+      state.skewered = null;
+      tryCollectRing(nx, ny);
+      msg = TEXT.marshFirm; sfxPush(); draw();
+      return;
+    }
+    state.tiles[landY][landX] = 'M';
+    moveUnicornTo(nx, ny);
+    botFollow(dx, dy);
+    state.skewered = tileAt(near.x, near.y) === 'M' ? near : null;
+    tryCollectRing(nx, ny);
+    if (ported) sfxDissolve();
+    else sfxPush();
+    draw();
+    return;
+  }
+
+  let isExit = isExitCell(nx,ny);
+
+  // the exit cell can also carry the sun beam (level0): let the step through to grab it, but keep
+  // the exit shut until the storm's gone — the rainbow forms where the beam was.
+  const ringOnExit = isExit && state.rings.some((r,i) => !r.collected && isRingVisible(i) && r.x===nx && r.y===ny);
+  if (isExit && !state.won && !ringOnExit){
+    if (anyStormsLeft()) say('exitBad');
+    else if (!anyRingCollected()) msg = TEXT.needSunRing;
+    else msg = TEXT.exitHidden;
+    blocked(); return;
+  }
+
+  if (tileAt(nx,ny) === '.'){
+    say('sky');
+    blocked(); return;
+  }
+
+  // level0: grass is scenery — only the dirt path ('D') carries the horse
+  if (tileAt(nx,ny) === 'G'){
+    blocked(); return;
+  }
+
+  // walking into M skewers it and, when the far end lands somewhere valid, drags it that same
+  // step instead of pinning then pressing again; falls back to a stationary in-place skewer
+  // when blocked. Far end rules match the skewer-drag branch above.
+  const walkObj = tileAt(nx,ny);
+  if (SKEWER_PUSH && walkObj === 'M'){
+    const near = { x: nx + dx, y: ny + dy };
+    const { x: landX, y: landY, ported } = resolveLanding(near, dx, dy);
+    const land = inBounds(landX,landY) ? tileAt(landX,landY) : null;
+    const canLand = (land === 'C' || land === '.') && !isExitCell(landX,landY);
+    if (canLand){
+      const onSky = land === '.';
+      vacate(nx, ny);
+      if (onSky){
+        state.tiles[landY][landX] = 'C';   // marshmallow spent, gap is now ordinary cloud
+        moveUnicornTo(nx, ny);
+        botFollow(dx, dy);
+        state.skewered = null;
+        tryCollectRing(nx, ny);
+        msg = TEXT.marshFirm; sfxPush(); draw();
+        return;
+      }
+      state.tiles[landY][landX] = 'M';
+      moveUnicornTo(nx, ny);
+      botFollow(dx, dy);
+      state.skewered = tileAt(near.x, near.y) === 'M' ? near : null;
+      tryCollectRing(nx, ny);
+      if (ported) sfxDissolve();
+      else {
+        if (levelIndex === 1 && !state.saidCarry){ state.saidCarry = true; msg = TEXT.mmCarry; } else say('skewerP');
+        sfxPush();
+      }
+    } else {
+      state.skewered = { x: nx, y: ny };
+      if (levelIndex === 1 && !state.saidCarry){ state.saidCarry = true; msg = TEXT.mmCarry; } else say('skewerP');
+      sfxPickup();
+    }
+    draw();
+    return;
+  }
+
+  if (PUSHABLE.includes(tileAt(nx,ny))){
+    const obj = tileAt(nx,ny);
+    const px = nx+dx, py = ny+dy;
+    const pushDest = inBounds(px,py) ? tileAt(px,py) : null;
+    const landTile = pushLanding(obj, pushDest);
+    if (landTile === null){ blocked(TEXT.noPush); return; }
+    const onSky = landTile !== obj;   // M was spent bridging a gap, see pushLanding
+    state.tiles[py][px] = landTile;
+    state.tiles[ny][nx] = 'C';
+    moveUnicornTo(nx, ny);
+    botFollow(dx, dy);
+    if (onSky) msg = TEXT.marshFirm;   // a plain push says nothing new, same convention as a plain step
+    sfxPush();
+    draw();
+    return;
+  }
+
+  // rain is pushable once hasWind is set (tryCollectWind, permanent) — always by walking, and it
+  // slides as far as it'll go (the old gustWind's slide loop) rather than one nudge.
+  if (tileAt(nx,ny) === 'S'){
+    if (!hasWind){
+      blocked(TEXT.rainBlocks); return;
+    }
+    const land = slideRain(nx, ny, dx, dy);
+    if (!land){
+      msg = TEXT.noPush;
+      sfxBlocked();
+    } else {
+      state.tiles[land.y][land.x] = 'S';
+      state.tiles[ny][nx] = 'C';
+      moveUnicornTo(nx, ny);
+      botFollow(dx, dy);
+      sfxPush();
+      animateRainPush(nx, ny, land.x, land.y);
+    }
+    draw();
+    return;
+  }
+
+  moveUnicornTo(nx, ny);
+  botFollow(dx, dy);
+
+  let teleported = false;
+  if (tileAt(nx,ny) === 'P'){
+    const tp = teleportAt(nx,ny);
+    if (tp){
+      const dest = teleportOther(tp, nx, ny);
+      moveUnicornTo(dest.x, dest.y);
+      nx = dest.x; ny = dest.y;
+      isExit = isExitCell(nx,ny);   // in case a portal ever lands you right on the exit
+      teleported = true;
+      sfxDissolve();
+    }
+  }
+
+  if (isExit && state.won){   // stepping onto the exit only finishes once the win is earned — you
+    state.finished = true;    // may land here first just to grab a coincident sun beam (level0)
+    sfxWin();
+    if (levelIndex + 1 < LEVELS.length){
+      msg = levelIndex === 0 ? TEXT.nextLevel0 : TEXT.nextLevel;
+      setTimeout(() => { levelIndex++; resetLevel(); }, LEVEL_TRANSITION_MS);
+    } else {
+      msg = TEXT.lastLevel;
+    }
+  }
+
+  tryCollectRing(nx, ny);
+  tryCollectHorn(nx, ny);
+  tryCollectWind(nx, ny);
+  tryCollectPot(nx, ny);
+  // a plain step says nothing — the bar holds its last line rather than churning every move; the
+  // idle nudge covers a bar left stale too long
+
+  draw();
+}
+
+// shared by handleMove's normal-tile fallback and its skewer-drag branch above
+// shared by the player and the bot (both use the default gotMsg now) — see moveBotMirror
+function tryCollectRing(nx, ny, gotMsg){
+  const ringIdx = state.rings.findIndex((r,i) => !r.collected && isRingVisible(i) && r.x === nx && r.y === ny);
+  if (ringIdx !== -1){
+    state.rings[ringIdx].collected = true;
+    state.ammo++;
+    sfxPickup();
+    if (checkWin()){
+      state.won = true;
+      if (levelIndex === 0) msg = TEXT.firstRainbow; else say('ringGet');
+      sfxWin();
+    } else if (levelIndex === 0){
+      msg = gotMsg || TEXT.gotRing;
+    }
+  }
+}
+// level0 only: the 'H' tile turns the hornless horse into a unicorn — from here it plays like any
+// level (grab the sun beam, clear the storm, cross the rainbow), see resetLevel's hasHorn init.
+function tryCollectHorn(nx, ny){
+  if (state.hasHorn || tileAt(nx,ny) !== 'H') return;
+  state.tiles[ny][nx] = 'D';
+  state.hasHorn = true;
+  msg = TEXT.gotHorn;
+  sfxPickup();
+  startMusic();   // colour and music arrive together — see draw()'s hasHorn filter
+}
+// like a sun ring: walking onto the gust collects it outright and unlocks hasWind
+// permanently (see its module-level declaration) — no skewer/carry step, unlike M.
+function tryCollectWind(nx, ny){
+  if (hasWind || tileAt(nx,ny) !== 'W') return;
+  state.tiles[ny][nx] = 'C';
+  hasWind = true;
+  msg = TEXT.gotWind;
+  sfxPickup();
+}
+// pot of gold ('O') — the altLayer finale collectible (level12 test): finding it ends the whole
+// game, not just the level. Reuses state.finished so every input handler already stops dead.
+function tryCollectPot(nx, ny){
+  if (state.finished || tileAt(nx,ny) !== 'O') return;
+  state.tiles[ny][nx] = 'C';
+  state.finished = true;
+  msg = TEXT.potFound;
+  sfxWin();
+}
+
+// Carrying a skewered M: pressing toward it (same as aim) drags it along; any other direction —
+// including the exact reversal — drops it and steps that way in one press.
+function attemptMove(dx, dy){
+  if (state.skewered && (dx !== state.aimDx || dy !== state.aimDy)){
+    unskewerByWalkingAway(dx, dy);
+    return;
+  }
+  const beforeX = state.unicorn.x, beforeY = state.unicorn.y;
+  handleMove(state.unicorn.x+dx, state.unicorn.y+dy);
+  // level0's origin story, told in two beats as the horse actually walks the path: the first
+  // step east, then the first turn north — not a general message queue, just these two triggers.
+  if (levelIndex === 0 && (state.unicorn.x !== beforeX || state.unicorn.y !== beforeY)){
+    if (dx===1 && dy===0 && !state.saidArk){ state.saidArk = true; msg = TEXT.originArk; }
+    else if (dx===0 && dy===-1 && !state.saidHelp){ state.saidHelp = true; msg = TEXT.originHelp; }
+    // post-win beat: "Now let's go somewhere..." on the first step back down, "...over the
+    // rainbow" (TEXT.nextLevel0) lands separately once the exit is actually reached.
+    else if (state.won && dx===0 && dy===1 && !state.saidGoRainbow){ state.saidGoRainbow = true; msg = TEXT.goRainbow; }
+  }
+  // level1: once the rain's cleared (saidMM, see finishBeam), the next step nudges toward the
+  // marshmallow — "Carry it..." (saidCarry) then takes over once it's actually skewered.
+  if (levelIndex === 1 && state.saidMM && !state.saidWalk && (state.unicorn.x !== beforeX || state.unicorn.y !== beforeY)){
+    state.saidWalk = true;
+    msg = TEXT.mmWalk;
+  }
+}
+// Drops the skewered M and, in the same press, steps one cell in the given direction when that
+// cell is clear (cloud / switch) and turns to face it; otherwise releases it in place.
+function unskewerByWalkingAway(dx, dy){
+  if (state.finished || state.beamAnimating) return;
+  const nx = state.unicorn.x + dx, ny = state.unicorn.y + dy;
+  if (BOT_MIRROR_ON_BLOCKED) moveBotMirror(dx, dy, nx, ny);
+  const destTile = inBounds(nx,ny) ? tileAt(nx,ny) : null;
+  const botBlocks = state.bot && nx === state.bot.x && ny === state.bot.y;
+  state.skewered = null;
+  if ('CX'.includes(destTile) && !botBlocks && !isExitCell(nx,ny)){
+    state.aimDx = dx; state.aimDy = dy;   // turn to face the way you just stepped
+    moveUnicornTo(nx, ny);
+    botFollow(dx, dy);
+    tryCollectRing(nx, ny);
+  }
+  say('drop');
+  sfxPush();
+  draw();
+}
+// fires the horn's beam in the current aim direction, from range. Requires the sun ring and a
+// single shot of ammo (granted on ring pickup) — always consumed on fire, hit or miss. The path
+// is precomputed, then played back one cell at a time (see BEAM_STEP_MS) so you can watch it
+// travel; movement and refiring are locked out (state.beamAnimating) until it resolves.
+// on mirror-unicorn levels the bot fires its own mirrored beam in lockstep with the player's —
+// free, no ammo cost of its own, same as its free mirrored moves — via runBeamTrace below; both
+// traces animate concurrently and finishBeam only resolves once every trace in flight has landed
+function fireHornBeam(){
+  if (state.finished || state.beamAnimating) return;
+  if (!anyRingCollected()){ blocked(TEXT.needSunRing); return; }
+  if (state.ammo <= 0){ blocked(TEXT.noAmmo); return; }
+  state.ammo--;
+  state.beamAnimating = true;
+
+  const playerTrace = traceBeamPath(state.unicorn.x+state.aimDx, state.unicorn.y+state.aimDy, state.aimDx, state.aimDy,
+    state.unicorn.x, state.unicorn.y, state.bot ? state.bot.x : undefined, state.bot ? state.bot.y : undefined);
+  const origin = cellCenter(state.unicorn.x, state.unicorn.y);
+  state.beam = [[{x:origin.cx, y:origin.cy}]];   // array of segments — see drawBeam
+
+  let botTrace = null;
+  if (state.bot){
+    const botDx = -state.aimDx, botDy = state.aimDy;   // mirrored aim, same convention as moveBotMirror
+    botTrace = traceBeamPath(state.bot.x+botDx, state.bot.y+botDy, botDx, botDy, state.bot.x, state.bot.y, state.unicorn.x, state.unicorn.y);
+    const botOrigin = cellCenter(state.bot.x, state.bot.y);
+    state.beamBot = [[{x:botOrigin.cx, y:botOrigin.cy}]];
+  }
+
+  let pending = botTrace ? 2 : 1;
+  let totalCount = 0, playerOutcome, botOutcome = null;
+  const done = (outcome, count, isBot) => {
+    if (isBot) botOutcome = outcome; else playerOutcome = outcome;
+    totalCount += count;
+    if (--pending === 0) finishBeam(playerOutcome, botOutcome, totalCount);
+  };
+  runBeamTrace(playerTrace, 'beam', (outcome, count) => done(outcome, count, false));
+  if (botTrace) runBeamTrace(botTrace, 'beamBot', (outcome, count) => done(outcome, count, true));
+}
+// plays one traced beam back one cell at a time into state[beamKey] (see drawBeam), clearing rain
+// and triggering switches as it goes, then reports its own {outcome,count} back via onDone
+function runBeamTrace(trace, beamKey, onDone){
+  let i = 0, count = 0;
+  const step = () => {
+    if (!state.beamAnimating) return;   // level was reset mid-flight — abandon this animation
+    if (i >= trace.path.length){ onDone(trace.outcome, count); return; }
+    const {x,y,jump} = trace.path[i++];
+    if (tileAt(x,y) === 'S'){
+      const reveal = state.reveals.find(r => r.x===x && r.y===y);
+      // alt-layer tile under the rain, else the ground it hid (grass on level0) or plain cloud
+      state.tiles[y][x] = reveal ? reveal.tile : (state.terrain ? terrainAt(x,y) : 'C');
+      count++;
+    }
+    else if (tileAt(x,y) === 'X'){ triggerSwitch(x,y); }
+    const p = cellCenter(x,y);
+    const segs = state[beamKey];
+    if (jump) segs.push([{x:p.cx, y:p.cy}]);   // reappearing at the far portal — start a fresh segment
+    else segs[segs.length-1].push({x:p.cx, y:p.cy});
+    draw();
+    setTimeout(step, BEAM_STEP_MS);
+  };
+  setTimeout(step, BEAM_STEP_MS);
+}
+function finishBeam(outcome, botOutcome, count){
+  const returned = outcome === 'returned' || botOutcome === 'returned';
+  const hit = outcome === 'hit' || botOutcome === 'hit';   // a beam reached the other unicorn and stopped there
+  const looped = outcome === 'looped';
+  if (returned || hit) state.ammo++;   // the light found its way back to you — no shot lost, win or not
+  if (count > 0 && checkWin()){
+    state.won = true;
+    if (levelIndex === 0) msg = TEXT.firstRainbow;
+    else if (levelIndex === 1 && !state.saidMM){ state.saidMM = true; msg = TEXT.mmExplain; }
+    else say('ringGet');
+    sfxWin();
+  } else if (hit){
+    sfxPickup();
+    msg = count > 0 ? TEXT.beamHitRain : TEXT.beamHitOnly;
+  } else if (returned){
+    sfxPickup();
+    msg = count > 0 ? TEXT.beamReturnRain : TEXT.beamReturnOnly;
+  } else if (looped){
+    sfxBlocked();
+    msg = count > 0 ? TEXT.beamLoopRain : TEXT.beamLoopOnly;
+  } else if (count > 0){
+    sfxDissolve();
+    if (levelIndex === 1 && !anyStormsLeft() && !state.saidMM){ state.saidMM = true; msg = TEXT.mmExplain; }
+    else say('beamHit');
+  } else {
+    sfxBlocked();
+    say('beamMiss');
+  }
+  state.beamAnimating = false;
+  draw();
+  setTimeout(() => { state.beam = null; state.beamBot = null; draw(); }, BEAM_FLASH_MS);
+}
+
+// true if this level has a gust (W tile) anywhere — for pre-collection messaging only
+function isWindLevel(){
+  return MAP.some(row => row.includes('W'));
+}
+// Space is context-sensitive: a pinned M -> release it in place; otherwise -> fire the horn beam
+// as usual. The gust has no Space-bar interaction at all — like a sun ring, walking onto it
+// collects it (see tryCollectWind).
+function fireOrSkewer(){
+  if (state.finished || state.beamAnimating) return;
+  // pinned M (see handleMove's skewer-drag branch): it's already sitting exactly where it should
+  // on the grid, so releasing is just unpinning it — no placement math or tile change needed.
+  if (state.skewered){
+    state.skewered = null;
+    say('drop');
+    sfxPush();
+    draw();
+    return;
+  }
+  fireHornBeam();
+}
+
+// --- input ------------------------------------------------------
+const canvas = document.getElementById('c');
+canvas.addEventListener('click', e=>{
+  if (!gameStarted) return;
+  startMusic();
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = W/rect.width, scaleY = H/rect.height;
+  const px = (e.clientX-rect.left)*scaleX, py = (e.clientY-rect.top)*scaleY;
+
+  if (px>=offX && px<offX+CELL*COLS && py>=offY && py<offY+CELL*ROWS){
+    withUndo(() => handleMove(Math.floor((px-offX)/CELL), Math.floor((py-offY)/CELL)));
+  }
+});
+
+document.addEventListener('keydown', e=>{
+  startMusic();
+  if (!gameStarted){
+    e.preventDefault(); gameStarted = true; clearInterval(introBlinkTimer); draw();
+    return;
+  }
+  if (e.key==='ArrowUp') withUndo(() => attemptMove(0,-1));
+  if (e.key==='ArrowDown') withUndo(() => attemptMove(0,1));
+  if (e.key==='ArrowLeft') withUndo(() => attemptMove(-1,0));
+  if (e.key==='ArrowRight') withUndo(() => attemptMove(1,0));
+  if (e.key===' '){ e.preventDefault(); withUndo(() => SKEWER_PUSH ? fireOrSkewer() : fireHornBeam()); }
+  if (e.key==='r' || e.key==='R') resetLevel();
+  if (e.key==='z' || e.key==='Z') undo();
+  if (LEVEL_NAV_ENABLED && (e.key==='n' || e.key==='N')) changeLevel(1);
+  if (LEVEL_NAV_ENABLED && (e.key==='p' || e.key==='P')) changeLevel(-1);
+});
+
+resetLevel();
+</script>
+</body>
+</html>
